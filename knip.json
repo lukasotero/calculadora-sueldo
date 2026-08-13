@@ -1,0 +1,6 @@
+{
+  "entry": ["src/app/**/*.{ts,tsx}", "tests/**/*.test.ts"],
+  "project": ["src/**/*.{ts,tsx}", "tests/**/*.ts"],
+  "ignore": ["src/lib/types.ts"],
+  "ignoreDependencies": ["lint-staged", "tailwindcss"]
+}

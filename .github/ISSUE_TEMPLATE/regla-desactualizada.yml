@@ -1,0 +1,20 @@
+name: Regla desactualizada
+description: Informá una diferencia respaldada por una fuente oficial.
+body:
+  - type: input
+    id: period
+    attributes: { label: Período, placeholder: "2026-08" }
+    validations: { required: true }
+  - type: input
+    id: source
+    attributes:
+      {
+        label: Fuente oficial,
+        description: Enlace a ARCA,
+        ANSES o Boletín Oficial,
+      }
+    validations: { required: true }
+  - type: textarea
+    id: detail
+    attributes: { label: Diferencia observada }
+    validations: { required: true }

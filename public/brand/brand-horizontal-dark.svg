@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 72" role="img" aria-labelledby="title">
+  <title id="title">Calculadora de Sueldo</title>
+  <g transform="translate(4 4) scale(1.3333)">
+    <rect width="48" height="48" rx="14" fill="#63d9bd"/>
+    <path d="M14 11.5h16.5a4 4 0 0 1 4 4V36l-4-2.5-4 2.5-4-2.5-4 2.5-4.5-2.75V11.5Z" fill="#102b32"/>
+    <path d="M19 19h10M19 24h6.5" stroke="#63d9bd" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="m25.5 28.5 2.5 2 5-6" stroke="#63d9bd" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="86" y="34" fill="#f5f6ef" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="750">Calculadora</text>
+  <text x="87" y="53" fill="#8ca4aa" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="650" letter-spacing="2.4">DE SUELDO</text>
+</svg>
