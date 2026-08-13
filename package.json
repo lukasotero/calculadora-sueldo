@@ -68,7 +68,7 @@
     "react-doctor": "^0.9.5",
     "serve": "^14.2.5",
     "tailwindcss": "^4.1.17",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "typescript-eslint": "^8.48.1",
     "vitest": "^4.0.15"
   },
