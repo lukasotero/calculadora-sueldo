@@ -164,6 +164,15 @@ describe("paystub audit", () => {
 });
 
 describe("positioned paystub parser", () => {
+  it("detects a labeled payment date without confusing other dates", () => {
+    const parsed = parsePositionedPaystub(
+      [...syntheticPaystub, ...row(745, [["FECHA DE PAGO: 02/08/2026", 300]])],
+      "recibo.pdf",
+    );
+
+    expect(parsed.paymentDate).toBe("2026-08-02");
+  });
+
   it("reconstructs fragmented rows and sorts their columns", () => {
     const rows = groupTextItemsIntoRows([
       token("TRABAJADOS", 80, 500.8),
@@ -294,4 +303,101 @@ describe("positioned paystub parser", () => {
     });
     expect(parsed.items[0].evidence.page).toBe(2);
   });
+
+  it("classifies an unprefixed amount table by its columns", () => {
+    const parsed = parsePositionedPaystub(
+      [
+        ...row(500, [["PERÍODO DE PAGO", 590]]),
+        ...row(485, [
+          ["Mayo", 610],
+          ["2026", 640],
+        ]),
+        ...row(460, [
+          ["CÓDIGO", 15],
+          ["CONCEPTO", 208],
+          ["REMUNERATIVO", 483],
+          ["NO REMUNERATIVO", 568],
+          ["DESCUENTOS", 669],
+          ["CONTRIBUCIONES", 752],
+        ]),
+        ...row(440, [
+          ["0201", 24],
+          ["SUELDO", 56],
+          ["1.885.500,00", 507],
+        ]),
+        ...row(430, [
+          ["0335", 24],
+          ["PROVISION INTERNET", 56],
+          ["40.000,00", 608],
+        ]),
+        ...row(420, [
+          ["0402", 24],
+          ["INSSJP LEY 19.032 (3%)", 56],
+          ["56.565,00", 699],
+        ]),
+        ...row(410, [
+          ["0501", 24],
+          ["CONTRIBUCION JUBILACION", 56],
+          ["338.129,34", 786],
+        ]),
+        ...row(200, [
+          ["TOTAL NETO", 585],
+          ["1.604.965,00", 759],
+        ]),
+        ...row(20, [
+          ["PERÍODO", 80],
+          ["Abril 2026", 100],
+        ]),
+      ],
+      "recibo.pdf",
+    );
+
+    expect(parsed.period).toBe("2026-05");
+    expect(parsed.statedNet).toBe(1_604_965);
+    expect(parsed.items).toEqual([
+      expect.objectContaining({
+        name: "SUELDO",
+        amount: 1_885_500,
+        kind: "remunerative",
+        destination: "salary",
+      }),
+      expect.objectContaining({
+        name: "PROVISION INTERNET",
+        amount: 40_000,
+        kind: "non-remunerative",
+      }),
+    ]);
+    expect(parsed.deductions).toEqual([
+      expect.objectContaining({
+        name: "INSSJP LEY 19.032 (3%)",
+        amount: 56_565,
+      }),
+    ]);
+    expect(parsed.rawText).toContain("CONTRIBUCION JUBILACION");
+    expect(
+      [...parsed.items, ...parsed.deductions].some((item) =>
+        item.name.includes("CONTRIBUCION"),
+      ),
+    ).toBe(false);
+  });
+
+  it.each(["SAC", "S.A.C.", "Aguinaldo", "Sueldo Anual Complementario"])(
+    "classifies %s as SAC",
+    (concept) => {
+      const parsed = parsePositionedPaystub(
+        [
+          ...row(120, [["EMPLEADOR EMPRESA DE PRUEBA", 10]]),
+          ...row(100, [["REMUNERATIVO", 100]]),
+          ...row(90, [
+            ["0001", 10],
+            [concept, 30],
+            ["500.000,00", 500],
+          ]),
+        ],
+        "sac-2026-06.pdf",
+      );
+
+      expect(parsed.items[0]).toMatchObject({ destination: "sac" });
+    },
+  );
 });

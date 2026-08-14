@@ -11,14 +11,13 @@ import {
   AlertCircle,
   ArrowRight,
   CheckCircle2,
-  Copy,
   FileCheck2,
   FileText,
   HelpCircle,
   Info,
   Loader2,
   LockKeyhole,
-  Pencil,
+  RefreshCw,
   RotateCcw,
   Save,
   Sparkles,
@@ -35,6 +34,15 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { SalaryHistoryChart } from "@/components/salary-history-chart";
 import { PeriodPicker } from "@/components/period-picker";
 import {
   Card,
@@ -92,20 +100,33 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
-  auditPaystub,
-  parsePaystub,
-  sumAdditionalPaystubDeductions,
-} from "@/lib/paystub-parser";
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { auditPaystub, parsePaystub } from "@/lib/paystub-parser";
+import { mergeSacScenario, scenarioFromPaystub } from "@/lib/scenario-merge";
 import {
   calculateNetToGross,
   calculateSalary,
   defaultScenario,
 } from "@/lib/salary-engine";
-import type { ParsedPaystub, SalaryScenario } from "@/lib/types";
-import { cn, money } from "@/lib/utils";
+import {
+  convertArsToUsd,
+  migrateHistoricalExchangeRates,
+} from "@/lib/exchange-rate";
+import { useExchangeRate } from "@/hooks/use-exchange-rate";
+import type {
+  ExchangeRateSnapshot,
+  ParsedPaystub,
+  SalaryScenario,
+} from "@/lib/types";
+import { cn, formatDate, money, usdMoney } from "@/lib/utils";
 
 type View = "calculator" | "receipt" | "saved";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type HistoricalUpdateStatus = "idle" | "updating" | "pending";
 type ScenarioUpdater = <K extends keyof SalaryScenario>(
   key: K,
   value: SalaryScenario[K],
@@ -145,7 +166,14 @@ function subscribeToSaved(onChange: () => void) {
 }
 
 function writeSavedSnapshot(next: SalaryScenario[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  const withoutLegacyNames = next.map((item) => {
+    const scenario = { ...item } as SalaryScenario & {
+      name?: unknown;
+    };
+    delete scenario.name;
+    return scenario;
+  });
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(withoutLegacyNames));
   savedSnapshotRaw = undefined;
   window.dispatchEvent(new Event(STORAGE_EVENT));
 }
@@ -156,15 +184,15 @@ const periodFormatter = new Intl.DateTimeFormat("es-AR", {
 });
 const numericFields = [
   ["basicSalary", "Sueldo básico", "Importe mensual bruto"],
-  ["seniority", "Antigüedad", "Porcentaje sobre el básico"],
-  ["overtime50Hours", "Horas extra 50%", "Cantidad de horas"],
-  ["overtime100Hours", "Horas extra 100%", "Cantidad de horas"],
-  ["holidayHours", "Horas en feriados", "Cantidad de horas"],
+  ["seniority", "Antigüedad", undefined],
+  ["overtime50Hours", "Horas extra 50%", undefined],
+  ["overtime100Hours", "Horas extra 100%", undefined],
+  ["holidayHours", "Horas en feriados", undefined],
   ["commissions", "Comisiones", "Importe remunerativo"],
   ["bonuses", "Bonos", "Importe remunerativo"],
   ["nonRemunerative", "No remunerativo", "Importe sin aportes"],
   ["sac", "SAC / aguinaldo", "Importe remunerativo"],
-  ["otherDeductions", "Otras deducciones", "Importe manual"],
+  ["otherDeductions", "Otras deducciones", undefined],
 ] as const;
 const saveLabels: Record<SaveStatus, string> = {
   idle: "Guardar escenario",
@@ -186,6 +214,16 @@ function formatPeriod(period: string) {
   return formatted.charAt(0).toUpperCase() + formatted.slice(1);
 }
 
+function exchangeRateDescription(snapshot: ExchangeRateSnapshot) {
+  if (snapshot.reference === "payment-date") {
+    return "Cotización correspondiente a la fecha de pago.";
+  }
+  if (snapshot.reference === "month-close") {
+    return "Cotización de cierre del período.";
+  }
+  return "Conversión calculada con la cotización disponible al guardar el escenario.";
+}
+
 export function SalaryCalculator() {
   const calculator = useSalaryCalculator();
   const {
@@ -204,16 +242,21 @@ export function SalaryCalculator() {
     setPaystubs,
     loading,
     uploadError,
+    uploadNotice,
     inputRef,
     result,
     update,
     saveScenario,
     saveStatus,
     removeSaved,
-    duplicateSaved,
-    renameSaved,
+    mergeSavedSac,
     uploadFiles,
     applyPaystub,
+    updatePaystubDestination,
+    exchangeRate,
+    historicalUpdateStatus,
+    historicalPendingCount,
+    retryHistoricalRates,
   } = calculator;
   const hasIncomeTaxData =
     scenario.spouse ||
@@ -297,7 +340,12 @@ export function SalaryCalculator() {
               </FieldGroup>
             </CardContent>
           </Card>
-          <ResultPanel result={result} mode={mode} targetNet={targetNet} />
+          <ResultPanel
+            result={result}
+            mode={mode}
+            targetNet={targetNet}
+            exchangeRate={exchangeRate}
+          />
         </div>
       )}
 
@@ -306,10 +354,12 @@ export function SalaryCalculator() {
           inputRef={inputRef}
           loading={loading}
           uploadError={uploadError}
+          uploadNotice={uploadNotice}
           paystubs={paystubs}
           result={result}
           onUpload={uploadFiles}
           onApply={applyPaystub}
+          onDestinationChange={updatePaystubDestination}
           onDelete={(id) =>
             setPaystubs((current) => current.filter((item) => item.id !== id))
           }
@@ -321,8 +371,10 @@ export function SalaryCalculator() {
           scenarios={saved}
           onCreate={() => setView("calculator")}
           onDelete={removeSaved}
-          onDuplicate={duplicateSaved}
-          onRename={renameSaved}
+          onMergeSac={mergeSavedSac}
+          historicalUpdateStatus={historicalUpdateStatus}
+          historicalPendingCount={historicalPendingCount}
+          onRetryHistoricalRates={retryHistoricalRates}
           onOpen={(item) => {
             setScenario(item);
             setView("calculator");
@@ -353,7 +405,6 @@ function NetSalaryFields({
       <div className="rounded-2xl border border-primary/30 bg-gradient-to-br from-primary/[.12] via-primary/[.04] to-transparent p-5 sm:p-6">
         <CalculatorField
           label="¿Cuánto querés recibir en mano?"
-          hint="Estimamos el sueldo bruto mensual necesario."
           htmlFor="target-net"
         >
           <MoneyInput
@@ -375,11 +426,7 @@ function NetSalaryFields({
           </AccordionTrigger>
           <AccordionContent>
             <FieldGroup>
-              <CalculatorField
-                label="Período"
-                hint="Las tablas y topes cambian según el mes."
-                htmlFor="period"
-              >
+              <CalculatorField label="Período" htmlFor="period">
                 <PeriodPicker
                   id="period"
                   value={scenario.period}
@@ -445,11 +492,7 @@ function GrossSalaryFields({
 }) {
   return (
     <>
-      <CalculatorField
-        label="Período"
-        hint="Disponible desde enero de 2026"
-        htmlFor="period"
-      >
+      <CalculatorField label="Período" htmlFor="period">
         <PeriodPicker
           id="period"
           value={scenario.period}
@@ -663,7 +706,17 @@ function useSalaryCalculator() {
   const [paystubs, setPaystubs] = useState<ParsedPaystub[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploadError, setUploadError] = useState<string>();
+  const [uploadNotice, setUploadNotice] = useState<string>();
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [historicalUpdateStatus, setHistoricalUpdateStatus] =
+    useState<HistoricalUpdateStatus>("idle");
+  const [historicalPendingCount, setHistoricalPendingCount] = useState(0);
+  const [historicalRetry, setHistoricalRetry] = useState(0);
+  const exchangeRate = useExchangeRate({
+    period: scenario.period,
+    paymentDate: scenario.paymentDate,
+    existingRate: scenario.exchangeRate,
+  });
   const inputRef = useRef<HTMLInputElement>(null);
   const saveInProgress = useRef(false);
   const saveResetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -689,11 +742,44 @@ function useSalaryCalculator() {
     [],
   );
 
+  useEffect(() => {
+    if (!saved.length) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setHistoricalUpdateStatus("updating");
+      void migrateHistoricalExchangeRates(
+        saved,
+        localStorage,
+        controller.signal,
+      ).then(({ scenarios: next, changed, pending }) => {
+        if (controller.signal.aborted) return;
+        if (changed) writeSavedSnapshot(next);
+        setHistoricalPendingCount(pending);
+        setHistoricalUpdateStatus(pending ? "pending" : "idle");
+      });
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [historicalRetry, saved]);
+
   function update<K extends keyof SalaryScenario>(
     key: K,
     value: SalaryScenario[K],
   ) {
-    setScenario((current) => ({ ...current, [key]: value }));
+    setScenario((current) => {
+      if (key !== "period") return { ...current, [key]: value };
+      const period = String(value);
+      return {
+        ...current,
+        period,
+        paymentDate: current.paymentDate?.startsWith(`${period}-`)
+          ? current.paymentDate
+          : undefined,
+        exchangeRate: undefined,
+      };
+    });
   }
   async function saveScenario() {
     if (saveInProgress.current) return;
@@ -709,12 +795,18 @@ function useSalaryCalculator() {
       {
         ...scenario,
         id: crypto.randomUUID(),
-        name: scenario.name.trim() || "Mi escenario",
+        exchangeRate: exchangeRate.rate ?? scenario.exchangeRate,
       },
     ];
     let resetDelay = 1500;
     try {
       writeSavedSnapshot(next);
+      if (scenario.sourcePaystubIds?.length) {
+        const savedIds = new Set(scenario.sourcePaystubIds);
+        setPaystubs((current) =>
+          current.filter((paystub) => !savedIds.has(paystub.id)),
+        );
+      }
       setSaveStatus("saved");
     } catch {
       resetDelay = 2000;
@@ -730,25 +822,14 @@ function useSalaryCalculator() {
     const next = saved.filter((item) => item.id !== id);
     writeSavedSnapshot(next);
   }
-  function duplicateSaved(source: SalaryScenario) {
-    const copy = {
-      ...source,
-      id: crypto.randomUUID(),
-      name: `Copia de ${source.name}`,
-    };
-    const next = [...saved, copy];
-    writeSavedSnapshot(next);
-  }
-  function renameSaved(id: string, name: string) {
-    const next = saved.map((item) =>
-      item.id === id ? { ...item, name } : item,
-    );
-    writeSavedSnapshot(next);
+  function mergeSavedSac(sacId: string, targetId: string) {
+    writeSavedSnapshot(mergeSacScenario(saved, sacId, targetId));
   }
   async function uploadFiles(files: FileList | File[] | null) {
     if (!files?.length) return;
     setLoading(true);
     setUploadError(undefined);
+    setUploadNotice(undefined);
     try {
       const selectedFiles = Array.from(files);
       selectedFiles.forEach((file) => {
@@ -756,7 +837,25 @@ function useSalaryCalculator() {
           throw new Error("Usá archivos PDF de hasta 10 MB.");
       });
       const parsed = await Promise.all(selectedFiles.map(parsePaystub));
-      setPaystubs((current) => [...current, ...parsed]);
+      const savedPaystubIds = new Set(
+        saved.flatMap((item) => item.sourcePaystubIds ?? []),
+      );
+      const available = parsed.filter(
+        (paystub) => !savedPaystubIds.has(paystub.id),
+      );
+      const ignoredCount = parsed.length - available.length;
+      if (ignoredCount) {
+        setUploadNotice(
+          ignoredCount === 1
+            ? "Ese recibo ya está guardado en Escenarios."
+            : `${ignoredCount} recibos ya están guardados en Escenarios.`,
+        );
+      }
+      setPaystubs((current) => {
+        const byId = new Map(current.map((paystub) => [paystub.id, paystub]));
+        available.forEach((paystub) => byId.set(paystub.id, paystub));
+        return Array.from(byId.values());
+      });
     } catch (error) {
       setUploadError(
         error instanceof Error ? error.message : "No pudimos leer el archivo.",
@@ -767,21 +866,33 @@ function useSalaryCalculator() {
     }
   }
   function applyPaystub(parsed: ParsedPaystub) {
-    const remunerative = parsed.items
-      .filter((item) => item.selected && item.kind === "remunerative")
-      .reduce((sum, item) => sum + item.amount, 0);
-    const nonRemunerative = parsed.items
-      .filter((item) => item.selected && item.kind === "non-remunerative")
-      .reduce((sum, item) => sum + item.amount, 0);
-    setScenario((current) => ({
-      ...current,
-      period: parsed.period ?? current.period,
-      basicSalary: remunerative || current.basicSalary,
-      nonRemunerative,
-      otherDeductions: sumAdditionalPaystubDeductions(parsed.deductions),
-    }));
+    setScenario(
+      scenarioFromPaystub(
+        { ...defaultScenario, id: crypto.randomUUID() },
+        parsed,
+      ),
+    );
     setMode("gross");
     setView("calculator");
+  }
+
+  function updatePaystubDestination(
+    paystubId: string,
+    itemId: string,
+    destination: "salary" | "sac",
+  ) {
+    setPaystubs((current) =>
+      current.map((paystub) =>
+        paystub.id === paystubId
+          ? {
+              ...paystub,
+              items: paystub.items.map((item) =>
+                item.id === itemId ? { ...item, destination } : item,
+              ),
+            }
+          : paystub,
+      ),
+    );
   }
 
   return {
@@ -800,16 +911,21 @@ function useSalaryCalculator() {
     setPaystubs,
     loading,
     uploadError,
+    uploadNotice,
     inputRef,
     result,
     update,
     saveScenario,
     saveStatus,
     removeSaved,
-    duplicateSaved,
-    renameSaved,
+    mergeSavedSac,
     uploadFiles,
     applyPaystub,
+    updatePaystubDestination,
+    exchangeRate,
+    historicalUpdateStatus,
+    historicalPendingCount,
+    retryHistoricalRates: () => setHistoricalRetry((current) => current + 1),
   };
 }
 
@@ -856,19 +972,27 @@ function ReceiptView({
   inputRef,
   loading,
   uploadError,
+  uploadNotice,
   paystubs,
   result,
   onUpload,
   onApply,
+  onDestinationChange,
   onDelete,
 }: {
   inputRef: React.RefObject<HTMLInputElement | null>;
   loading: boolean;
   uploadError?: string;
+  uploadNotice?: string;
   paystubs: ParsedPaystub[];
   result: ReturnType<typeof calculateSalary>;
   onUpload: (files: FileList | File[] | null) => Promise<void>;
   onApply: (paystub: ParsedPaystub) => void;
+  onDestinationChange: (
+    paystubId: string,
+    itemId: string,
+    destination: "salary" | "sac",
+  ) => void;
   onDelete: (id: string) => void;
 }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -967,6 +1091,13 @@ function ReceiptView({
               <AlertDescription>{uploadError}</AlertDescription>
             </Alert>
           )}
+          {uploadNotice && (
+            <Alert className="mt-5 max-w-xl text-left">
+              <CheckCircle2 />
+              <AlertTitle>Recibo ya guardado</AlertTitle>
+              <AlertDescription>{uploadNotice}</AlertDescription>
+            </Alert>
+          )}
         </CardContent>
       </Card>
       {paystubs.map((parsed) => (
@@ -975,6 +1106,9 @@ function ReceiptView({
           parsed={parsed}
           result={result}
           onApply={() => onApply(parsed)}
+          onDestinationChange={(itemId, destination) =>
+            onDestinationChange(parsed.id, itemId, destination)
+          }
           onDelete={() => onDelete(parsed.id)}
         />
       ))}
@@ -982,25 +1116,74 @@ function ReceiptView({
   );
 }
 
+function HistoricalUpdateNotice({
+  status,
+  pendingCount,
+  onRetry,
+}: {
+  status: HistoricalUpdateStatus;
+  pendingCount: number;
+  onRetry: () => void;
+}) {
+  if (status === "updating") {
+    return (
+      <p
+        className="mb-4 flex items-center gap-2 text-sm text-muted-foreground"
+        role="status"
+      >
+        <Loader2 className="animate-spin" /> Actualizando cotizaciones
+        históricas…
+      </p>
+    );
+  }
+  if (status !== "pending") return null;
+  return (
+    <Alert className="mb-4">
+      <AlertCircle />
+      <AlertTitle>Quedaron cotizaciones pendientes</AlertTitle>
+      <AlertDescription>
+        No pudimos actualizar {pendingCount}{" "}
+        {pendingCount === 1 ? "escenario" : "escenarios"}. Conservamos sus
+        valores anteriores para no perder información.
+      </AlertDescription>
+      <Button
+        className="mt-3 w-fit"
+        size="sm"
+        variant="outline"
+        onClick={onRetry}
+      >
+        <RefreshCw data-icon="inline-start" /> Reintentar
+      </Button>
+    </Alert>
+  );
+}
+
 function SavedScenariosView({
   scenarios,
   onCreate,
   onDelete,
-  onDuplicate,
-  onRename,
+  onMergeSac,
   onOpen,
+  historicalUpdateStatus,
+  historicalPendingCount,
+  onRetryHistoricalRates,
 }: {
   scenarios: SalaryScenario[];
   onCreate: () => void;
   onDelete: (id: string) => void;
-  onDuplicate: (scenario: SalaryScenario) => void;
-  onRename: (id: string, name: string) => void;
+  onMergeSac: (sacId: string, targetId: string) => void;
   onOpen: (scenario: SalaryScenario) => void;
+  historicalUpdateStatus: HistoricalUpdateStatus;
+  historicalPendingCount: number;
+  onRetryHistoricalRates: () => void;
 }) {
   const [deleteCandidate, setDeleteCandidate] = useState<string>();
+  const [mergeCandidate, setMergeCandidate] = useState<SalaryScenario>();
+  const [mergeTargetId, setMergeTargetId] = useState("");
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
-  const scenarioToDelete = scenarios.find(
-    (scenario) => scenario.id === deleteCandidate,
+  const orderedScenarios = useMemo(
+    () => scenarios.toSorted((a, b) => b.period.localeCompare(a.period)),
+    [scenarios],
   );
 
   useEffect(() => {
@@ -1035,37 +1218,39 @@ function SavedScenariosView({
 
   return (
     <>
+      <HistoricalUpdateNotice
+        status={historicalUpdateStatus}
+        pendingCount={historicalPendingCount}
+        onRetry={onRetryHistoricalRates}
+      />
+      <div className="mb-6">
+        <SalaryHistoryChart scenarios={scenarios} />
+      </div>
       <div className="grid min-w-0 gap-4 md:grid-cols-2">
-        {scenarios.map((item) => {
+        {orderedScenarios.map((item) => {
           const itemResult = calculateSalary(item);
+          const monthlyCandidates = scenarios.filter(
+            (candidate) =>
+              candidate.id !== item.id &&
+              candidate.scenarioType !== "sac" &&
+              candidate.period === item.period,
+          );
           return (
             <Card key={item.id} className="min-w-0 overflow-hidden">
               <CardHeader>
-                <Badge variant="outline" className="mb-2 w-fit">
-                  {formatPeriod(item.period)}
-                </Badge>
-                <CardTitle className="sr-only">{item.name}</CardTitle>
-                <Field>
-                  <FieldLabel htmlFor={`scenario-name-${item.id}`}>
-                    Nombre del escenario
-                  </FieldLabel>
-                  <div className="flex items-center gap-2">
-                    <Pencil className="shrink-0 text-muted-foreground" />
-                    <Input
-                      id={`scenario-name-${item.id}`}
-                      value={item.name}
-                      maxLength={60}
-                      onChange={(event) =>
-                        onRename(item.id, event.target.value)
-                      }
-                      onBlur={(event) => {
-                        if (!event.target.value.trim()) {
-                          onRename(item.id, "Mi escenario");
-                        }
-                      }}
-                    />
-                  </div>
-                </Field>
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{formatPeriod(item.period)}</Badge>
+                  {item.sac > 0 ? (
+                    <Badge>
+                      {item.scenarioType === "sac"
+                        ? "SAC individual"
+                        : "Incluye SAC"}
+                    </Badge>
+                  ) : null}
+                </div>
+                <CardTitle className="sr-only">
+                  Escenario de {formatPeriod(item.period)}
+                </CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-5">
                 <div>
@@ -1075,6 +1260,29 @@ function SavedScenariosView({
                   <p className="mt-1 text-sm text-muted-foreground">
                     Neto estimado
                   </p>
+                  {item.exchangeRate ? (
+                    <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[.06] px-3 py-2.5">
+                      <p className="font-mono text-lg font-bold tabular-nums">
+                        {usdMoney.format(
+                          convertArsToUsd(
+                            itemResult.net,
+                            item.exchangeRate.rate,
+                          ) ?? 0,
+                        )}
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                        {exchangeRateDescription(item.exchangeRate)}
+                      </p>
+                      <p className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">
+                        1 USD = {money.format(item.exchangeRate.rate)} ·{" "}
+                        {formatDate(item.exchangeRate.date)}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-muted-foreground">
+                      Sin cotización guardada
+                    </p>
+                  )}
                 </div>
                 <div className="grid grid-cols-2 gap-3 rounded-xl bg-muted/60 p-4">
                   <div>
@@ -1098,15 +1306,28 @@ function SavedScenariosView({
                 >
                   Abrir escenario <ArrowRight data-icon="inline-end" />
                 </Button>
+                {item.scenarioType === "sac" && (
+                  <>
+                    <Button
+                      variant="outline"
+                      className="min-h-11 w-full sm:w-auto"
+                      disabled={monthlyCandidates.length === 0}
+                      onClick={() => {
+                        setMergeCandidate(item);
+                        setMergeTargetId(monthlyCandidates[0]?.id ?? "");
+                      }}
+                    >
+                      Unir con escenario mensual
+                    </Button>
+                    {monthlyCandidates.length === 0 && (
+                      <p className="w-full text-xs leading-5 text-muted-foreground">
+                        Primero guardá un escenario mensual de este mismo mes.
+                      </p>
+                    )}
+                  </>
+                )}
                 <Button
-                  variant="outline"
-                  className="min-h-11 w-full sm:w-auto"
-                  onClick={() => onDuplicate(item)}
-                >
-                  <Copy data-icon="inline-start" /> Duplicar
-                </Button>
-                <Button
-                  aria-label={`Eliminar ${item.name}`}
+                  aria-label={`Eliminar escenario de ${formatPeriod(item.period)}`}
                   className="min-h-11 w-full sm:w-auto"
                   variant="ghost"
                   onClick={() => setDeleteCandidate(item.id)}
@@ -1118,6 +1339,73 @@ function SavedScenariosView({
           );
         })}
       </div>
+      <Dialog
+        open={Boolean(mergeCandidate)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setMergeCandidate(undefined);
+            setMergeTargetId("");
+          }
+        }}
+      >
+        <DialogContent className="w-[calc(100%-2rem)] rounded-2xl sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Unir SAC con escenario mensual</DialogTitle>
+            <DialogDescription>
+              Elegí un escenario de {formatPeriod(mergeCandidate?.period ?? "")}
+              . El SAC independiente se eliminará después de unirlo.
+            </DialogDescription>
+          </DialogHeader>
+          <Field>
+            <FieldLabel htmlFor="merge-sac-target">
+              Escenario mensual
+            </FieldLabel>
+            <Select value={mergeTargetId} onValueChange={setMergeTargetId}>
+              <SelectTrigger id="merge-sac-target">
+                <SelectValue placeholder="Seleccioná un escenario" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {scenarios.reduce<React.ReactNode[]>((options, candidate) => {
+                    if (
+                      candidate.scenarioType === "sac" ||
+                      candidate.period !== mergeCandidate?.period
+                    ) {
+                      return options;
+                    }
+                    options.push(
+                      <SelectItem key={candidate.id} value={candidate.id}>
+                        Neto {money.format(calculateSalary(candidate).net)} ·
+                        Básico {money.format(candidate.basicSalary)}
+                      </SelectItem>,
+                    );
+                    return options;
+                  }, [])}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </Field>
+          <DialogFooter className="gap-3">
+            <Button
+              variant="outline"
+              onClick={() => setMergeCandidate(undefined)}
+            >
+              Cancelar
+            </Button>
+            <Button
+              disabled={!mergeCandidate || !mergeTargetId}
+              onClick={() => {
+                if (!mergeCandidate || !mergeTargetId) return;
+                onMergeSac(mergeCandidate.id, mergeTargetId);
+                setMergeCandidate(undefined);
+                setMergeTargetId("");
+              }}
+            >
+              Unir SAC
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <dialog
         ref={deleteDialogRef}
         aria-labelledby="delete-scenario-title"
@@ -1138,7 +1426,7 @@ function SavedScenariosView({
               id="delete-scenario-description"
               className="leading-6 text-muted-foreground"
             >
-              “{scenarioToDelete?.name}” se eliminará de este dispositivo. Esta
+              El escenario seleccionado se eliminará de este dispositivo. Esta
               acción no se puede deshacer.
             </p>
           </div>
@@ -1178,45 +1466,31 @@ function CalculatorField({
   htmlFor?: string;
   children: React.ReactNode;
 }) {
-  const [helpOpen, setHelpOpen] = useState(false);
-
   return (
     <Field className="min-w-0">
-      <div className="flex min-w-0 items-center gap-2">
-        <FieldLabel htmlFor={htmlFor}>{label}</FieldLabel>
-        {hint && (
-          <Popover open={helpOpen} onOpenChange={setHelpOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-7 shrink-0"
-                aria-label={`Más información sobre ${label}`}
-                onMouseEnter={() => setHelpOpen(true)}
-                onMouseLeave={() => setHelpOpen(false)}
-                onFocus={(event) => {
-                  if (event.currentTarget.matches(":focus-visible")) {
-                    setHelpOpen(true);
-                  }
-                }}
-                onBlur={() => setHelpOpen(false)}
+      {hint ? (
+        <TooltipProvider delayDuration={250}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <FieldLabel
+                htmlFor={htmlFor}
+                tabIndex={0}
+                className="w-fit cursor-help decoration-dotted underline-offset-4 hover:underline focus-visible:underline"
               >
-                <HelpCircle />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent
-              role="tooltip"
-              className="w-64 max-w-[calc(100vw-2rem)] text-sm"
-              align="start"
-              collisionPadding={16}
-              onOpenAutoFocus={(event) => event.preventDefault()}
+                {label}
+              </FieldLabel>
+            </TooltipTrigger>
+            <TooltipContent
+              side="top"
+              className="max-w-64 text-pretty text-center"
             >
               {hint}
-            </PopoverContent>
-          </Popover>
-        )}
-      </div>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ) : (
+        <FieldLabel htmlFor={htmlFor}>{label}</FieldLabel>
+      )}
       {children}
     </Field>
   );
@@ -1251,10 +1525,17 @@ function ResultPanel({
   result,
   mode,
   targetNet,
+  exchangeRate,
 }: {
   result: ReturnType<typeof calculateSalary>;
   mode: "gross" | "net";
   targetNet: number;
+  exchangeRate: {
+    rate?: ExchangeRateSnapshot;
+    status: "loading" | "success" | "error" | "unavailable";
+    isCached: boolean;
+    refresh: () => Promise<void>;
+  };
 }) {
   const rows = [
     ["Jubilación · 11%", result.pension],
@@ -1264,6 +1545,9 @@ function ResultPanel({
     ["Ganancias estimada", result.incomeTax],
     ["Otras deducciones", result.otherDeductions],
   ] as const;
+  const netInUsd = exchangeRate.rate
+    ? convertArsToUsd(result.net, exchangeRate.rate.rate)
+    : undefined;
   return (
     <aside className="min-w-0 lg:sticky lg:top-24 lg:self-start">
       <Card className="min-w-0 border-primary/25 bg-gradient-to-b from-primary/[.08] to-card">
@@ -1303,6 +1587,54 @@ function ResultPanel({
               </div>
             </div>
           ) : null}
+          <div className="mb-5 rounded-2xl border border-primary/20 bg-background/60 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[.12em] text-muted-foreground">
+                  Neto equivalente en dólares
+                </p>
+                {netInUsd != null ? (
+                  <p className="mt-1 font-mono text-2xl font-bold tabular-nums text-primary">
+                    {usdMoney.format(netInUsd)}
+                  </p>
+                ) : exchangeRate.status === "loading" ? (
+                  <p
+                    className="mt-2 text-sm text-muted-foreground"
+                    role="status"
+                  >
+                    Consultando cotización oficial…
+                  </p>
+                ) : (
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    Cotización no disponible
+                  </p>
+                )}
+              </div>
+              {exchangeRate.status === "error" ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void exchangeRate.refresh()}
+                >
+                  <RefreshCw data-icon="inline-start" /> Reintentar
+                </Button>
+              ) : null}
+            </div>
+            {exchangeRate.rate ? (
+              <>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  Dólar oficial vendedor BCRA:{" "}
+                  {money.format(exchangeRate.rate.rate)} ·{" "}
+                  {formatDate(exchangeRate.rate.date)}
+                  {exchangeRate.isCached ? " · Cotización guardada" : ""}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {exchangeRateDescription(exchangeRate.rate)}
+                </p>
+              </>
+            ) : null}
+          </div>
           <Progress
             className="mb-5"
             value={Math.max(
@@ -1351,7 +1683,7 @@ function ResultPanel({
               </ul>
               <p className="mt-2 text-xs leading-5 text-muted-foreground">
                 Fuente: {result.rulesSource}. Verificado el{" "}
-                {result.rulesVerifiedAt}.
+                {formatDate(result.rulesVerifiedAt)}.
               </p>
             </AlertDescription>
           </Alert>
@@ -1402,11 +1734,13 @@ function PaystubReview({
   parsed,
   result,
   onApply,
+  onDestinationChange,
   onDelete,
 }: {
   parsed: ParsedPaystub;
   result: ReturnType<typeof calculateSalary>;
   onApply: () => void;
+  onDestinationChange: (itemId: string, destination: "salary" | "sac") => void;
   onDelete: () => void;
 }) {
   const findings = auditPaystub(parsed, result);
@@ -1425,6 +1759,11 @@ function PaystubReview({
               · {parsed.items.length + parsed.deductions.length} conceptos
               detectados
             </CardDescription>
+            {parsed.paymentDate ? (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Fecha de pago detectada: {formatDate(parsed.paymentDate)}
+              </p>
+            ) : null}
           </div>
           <Button
             variant="ghost"
@@ -1489,11 +1828,32 @@ function PaystubReview({
                       </p>
                     </TableCell>
                     <TableCell>
-                      {"kind" in item
-                        ? item.kind === "remunerative"
-                          ? "Remunerativo"
-                          : "No remunerativo"
-                        : "Deducción"}
+                      {"kind" in item && item.kind === "remunerative" ? (
+                        <Select
+                          value={item.destination ?? "salary"}
+                          onValueChange={(value) =>
+                            onDestinationChange(
+                              item.id,
+                              value as "salary" | "sac",
+                            )
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-44"
+                            aria-label={`Clasificación de ${item.name}`}
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="salary">Remunerativo</SelectItem>
+                            <SelectItem value="sac">SAC / aguinaldo</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      ) : "kind" in item ? (
+                        "No remunerativo"
+                      ) : (
+                        "Deducción"
+                      )}
                     </TableCell>
                     <TableCell className="text-right font-mono">
                       {money.format(item.amount)}
@@ -1517,6 +1877,16 @@ function PaystubReview({
             </TableBody>
           </Table>
         </div>
+        {parsed.items.length + parsed.deductions.length === 0 && (
+          <details className="rounded-xl border bg-muted/30 p-4">
+            <summary className="cursor-pointer font-medium">
+              Ver texto extraído para revisión manual
+            </summary>
+            <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs text-muted-foreground">
+              {parsed.rawText}
+            </pre>
+          </details>
+        )}
         <div className="grid gap-3 sm:grid-cols-2">
           {findings.map((finding) => (
             <Alert

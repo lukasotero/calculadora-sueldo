@@ -21,9 +21,17 @@ export interface TaxYearToDate {
   withheldTax: number;
 }
 
+export interface ExchangeRateSnapshot {
+  rate: number;
+  date: string;
+  source: "BCRA";
+  period?: string;
+  reference?: "latest" | "payment-date" | "month-close";
+  requestedDate?: string;
+}
+
 export interface SalaryScenario {
   id: string;
-  name: string;
   period: string;
   basicSalary: number;
   seniority: number;
@@ -40,6 +48,10 @@ export interface SalaryScenario {
   children: number;
   otherDeductions: number;
   ytd: TaxYearToDate;
+  exchangeRate?: ExchangeRateSnapshot;
+  paymentDate?: string;
+  scenarioType?: "salary" | "sac";
+  sourcePaystubIds?: string[];
 }
 
 export interface NetToGrossScenario {
@@ -73,12 +85,14 @@ export interface ExtractionEvidence {
 export interface ParsedPaystubItem extends EarningItem {
   evidence: ExtractionEvidence;
   selected: boolean;
+  destination?: "salary" | "sac";
 }
 
 export interface ParsedPaystub {
   id: string;
   fileName: string;
   period?: string;
+  paymentDate?: string;
   employer?: string;
   employee?: string;
   items: ParsedPaystubItem[];

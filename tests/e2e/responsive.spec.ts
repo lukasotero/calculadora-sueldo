@@ -95,12 +95,9 @@ test("all responsive tiers remain inside the viewport", async ({
     await page
       .getByRole("button", { name: /Calculado con reglas de Agosto de 2026/ })
       .click();
-    await page
-      .getByRole("button", { name: "Más información sobre Período" })
-      .hover();
-    await expect(page.getByRole("tooltip")).toBeInViewport();
-    await expectNoPageOverflow(page, `${label}: popover open`);
-    await page.keyboard.press("Escape");
+    await expect(
+      page.getByRole("button", { name: "Más información sobre Período" }),
+    ).toHaveCount(0);
 
     await page
       .getByRole("checkbox", { name: "Agregar cuota sindical" })

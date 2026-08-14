@@ -23,7 +23,7 @@ interface TextRow {
 
 type PaystubSection = "remunerative" | "non-remunerative" | "deduction";
 
-const moneyPattern = /\$\s*-?\s*[\d.]+,\d{2}/i;
+const moneyPattern = /^\s*\$?\s*-?\s*\d+(?:\.\d{3})*,\d{2}(?:\(\*\))?\s*$/i;
 const monthNames: Record<string, string> = {
   enero: "01",
   febrero: "02",
@@ -66,10 +66,18 @@ export function sumAdditionalPaystubDeductions(
 function parseArgentineAmount(value: string) {
   const normalized = value
     .replace(/\$/g, "")
+    .replace(/\(\*\)/g, "")
     .replace(/\s/g, "")
     .replace(/\./g, "")
     .replace(",", ".");
   return Number(normalized);
+}
+
+function isSacConcept(value: string) {
+  const normalized = normalizeText(value);
+  return /(?:\bS\.?\s*A\.?\s*C\.?(?=\s|$)|\bAGUINALDO\b|\bSUELDO ANUAL COMPLEMENTARIO\b)/i.test(
+    normalized,
+  );
 }
 
 function rowText(items: PositionedTextItem[]) {
@@ -176,8 +184,24 @@ function valueBelowHeader(
 function detectPeriod(rows: TextRow[], fileName: string) {
   for (let index = 0; index < rows.length; index += 1) {
     if (/PER[IÍ]ODO DE PAGO/i.test(rows[index].text)) {
+      const nearbyRows: string[] = [];
+      for (
+        let candidateIndex = index + 1;
+        candidateIndex < Math.min(index + 4, rows.length);
+        candidateIndex += 1
+      ) {
+        const candidate = rows[candidateIndex];
+        if (
+          candidate.page === rows[index].page &&
+          rows[index].y - candidate.y < 35
+        ) {
+          nearbyRows.push(candidate.text);
+        }
+      }
+      const nearbyText = nearbyRows.join(" ");
       const candidate =
         periodFromText(rows[index].text) ??
+        periodFromText(nearbyText) ??
         periodFromText(
           valueBelowHeader(rows, index, /PER[IÍ]ODO DE PAGO/i) ?? "",
         );
@@ -228,6 +252,39 @@ function detectPeriod(rows: TextRow[], fileName: string) {
   return filePeriod ? `${filePeriod[1]}-${filePeriod[2]}` : undefined;
 }
 
+function dateFromText(text: string) {
+  const numeric = text.match(
+    /\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-](20\d{2})\b/,
+  );
+  const iso = text.match(/\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/);
+  const year = Number(numeric?.[3] ?? iso?.[1]);
+  const month = Number(numeric?.[2] ?? iso?.[2]);
+  const day = Number(numeric?.[1] ?? iso?.[3]);
+  if (!year || !month || !day) return undefined;
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day
+  ) {
+    return undefined;
+  }
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function detectPaymentDate(rows: TextRow[]) {
+  const label = /FECHA\s+(?:DE\s+)?PAGO/i;
+  const candidates = new Set<string>();
+  for (let index = 0; index < rows.length; index += 1) {
+    if (!label.test(rows[index].text)) continue;
+    const inline = dateFromText(rows[index].text);
+    const below = dateFromText(valueBelowHeader(rows, index, label) ?? "");
+    if (inline) candidates.add(inline);
+    if (below) candidates.add(below);
+  }
+  return candidates.size === 1 ? [...candidates][0] : undefined;
+}
+
 function detectLabeledValue(rows: TextRow[], label: RegExp) {
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
@@ -242,15 +299,68 @@ function detectLabeledValue(rows: TextRow[], label: RegExp) {
 }
 
 function detectNet(rows: TextRow[]) {
-  for (const row of rows) {
-    if (!/(?:SUELDO|TOTAL)?\s*NETO(?:\s+A\s+(?:COBRAR|PAGAR))?/i.test(row.text))
-      continue;
-    const amounts = row.items
-      .filter((item) => moneyPattern.test(item.text))
-      .sort((a, b) => b.x - a.x);
-    if (amounts[0]) return parseArgentineAmount(amounts[0].text);
+  const label = /(?:SUELDO|TOTAL)?\s*NETO(?:\s+A\s+(?:COBRAR|PAGAR))?/i;
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
+    const labelItem = row.items.find((item) => label.test(item.text));
+    if (!labelItem && !label.test(row.text)) continue;
+    const anchorX = labelItem?.x ?? row.items[0]?.x ?? 0;
+    const candidates: PositionedTextItem[] = [];
+    for (const candidate of rows) {
+      if (candidate.page !== row.page || Math.abs(candidate.y - row.y) >= 30) {
+        continue;
+      }
+      for (const item of candidate.items) {
+        if (moneyPattern.test(item.text) && item.x > anchorX) {
+          candidates.push(item);
+        }
+      }
+    }
+    candidates.sort(
+      (a, b) => Math.abs(a.y - row.y) - Math.abs(b.y - row.y) || b.x - a.x,
+    );
+    if (candidates[0]) return parseArgentineAmount(candidates[0].text);
   }
   return undefined;
+}
+
+interface ColumnLayout {
+  page: number;
+  columns: Array<{ x: number; section: PaystubSection | "contribution" }>;
+}
+
+function columnLayoutFromRow(row: TextRow): ColumnLayout | undefined {
+  const headers: ColumnLayout["columns"] = row.items.flatMap((item) => {
+    const normalized = normalizeText(item.text).toUpperCase();
+    const section =
+      normalized === "REMUNERATIVO"
+        ? "remunerative"
+        : normalized === "NO REMUNERATIVO"
+          ? "non-remunerative"
+          : /^(DESCUENTOS?|DEDUCCIONES?)$/.test(normalized)
+            ? "deduction"
+            : /^CONTRIBUCIONES?$/.test(normalized)
+              ? "contribution"
+              : undefined;
+    return section
+      ? [
+          {
+            x: item.x + item.width / 2,
+            section: section as PaystubSection | "contribution",
+          },
+        ]
+      : [];
+  });
+  return headers.length >= 2
+    ? { page: row.page, columns: headers.sort((a, b) => a.x - b.x) }
+    : undefined;
+}
+
+function sectionForColumn(layout: ColumnLayout, item: PositionedTextItem) {
+  const center = item.x + item.width / 2;
+  return [...layout.columns].sort(
+    (a, b) => Math.abs(a.x - center) - Math.abs(b.x - center),
+  )[0]?.section;
 }
 
 export function parsePositionedPaystub(
@@ -267,9 +377,16 @@ export function parsePositionedPaystub(
   const items: ParsedPaystubItem[] = [];
   const deductions: ParsedPaystub["deductions"] = [];
   let section: PaystubSection | undefined;
+  let columnLayout: ColumnLayout | undefined;
   let rowId = 0;
 
   for (const row of rows) {
+    const nextColumnLayout = columnLayoutFromRow(row);
+    if (nextColumnLayout) {
+      columnLayout = nextColumnLayout;
+      section = undefined;
+      continue;
+    }
     const nextSection = sectionFromRow(row.text);
     if (nextSection) {
       section = nextSection;
@@ -279,13 +396,16 @@ export function parsePositionedPaystub(
       section = undefined;
       continue;
     }
-    if (!section) continue;
-
     const amounts = row.items
       .filter((item) => moneyPattern.test(item.text))
       .sort((a, b) => b.x - a.x);
     const amountItem = amounts[0];
     if (!amountItem) continue;
+    const rowSection =
+      columnLayout?.page === row.page
+        ? sectionForColumn(columnLayout, amountItem)
+        : section;
+    if (!rowSection || rowSection === "contribution") continue;
 
     const firstNonConceptIndex = row.items.findIndex(
       (item) =>
@@ -308,7 +428,7 @@ export function parsePositionedPaystub(
       confidence: "high" as const,
     };
     rowId += 1;
-    if (section === "deduction") {
+    if (rowSection === "deduction") {
       deductions.push({
         id: `d-${row.page}-${rowId}`,
         name,
@@ -321,7 +441,8 @@ export function parsePositionedPaystub(
         id: `e-${row.page}-${rowId}`,
         name,
         amount: value,
-        kind: section,
+        kind: rowSection,
+        destination: isSacConcept(name) ? "sac" : "salary",
         evidence,
         selected: true,
       });
@@ -332,6 +453,7 @@ export function parsePositionedPaystub(
     id: crypto.randomUUID(),
     fileName,
     period: detectPeriod(rows, fileName),
+    paymentDate: detectPaymentDate(rows),
     employer: detectLabeledValue(rows, /^(?:EMPLEADOR|RAZ[ÓO]N SOCIAL)$/i),
     employee: detectLabeledValue(rows, /APELLIDO Y NOMBRE/i),
     items,
@@ -354,6 +476,10 @@ export async function parsePaystub(file: File): Promise<ParsedPaystub> {
     import.meta.url,
   ).toString();
   const data = new Uint8Array(await file.arrayBuffer());
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const fileId = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
   const document = await pdfjs.getDocument({ data, useWorkerFetch: false })
     .promise;
   const pages = await Promise.all(
@@ -376,7 +502,10 @@ export async function parsePaystub(file: File): Promise<ParsedPaystub> {
       });
     }),
   );
-  return parsePositionedPaystub(pages.flat(), file.name);
+  return {
+    ...parsePositionedPaystub(pages.flat(), file.name),
+    id: fileId,
+  };
 }
 
 export function auditPaystub(

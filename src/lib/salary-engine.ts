@@ -233,7 +233,6 @@ export function solveGrossForNet(targetNet: number, base: SalaryScenario) {
 
 export const defaultScenario: SalaryScenario = {
   id: "actual",
-  name: "Mi escenario",
   period: getLatestConfirmedPeriod(),
   basicSalary: 1_800_000,
   seniority: 0,
