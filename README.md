@@ -26,6 +26,8 @@ servidor.
 - Cálculo orientativo de Ganancias mediante acumulados del año.
 - Lectura local de recibos de sueldo en PDF digital.
 - Identificación y revisión de conceptos extraídos del recibo.
+- Clasificación por naturaleza y tratamiento legal, con inclusión manual y
+  trazabilidad en escenarios guardados.
 - Comparación orientativa entre el recibo y el resultado calculado.
 - Escenarios guardados localmente en el navegador.
 - Tema oscuro predeterminado con opción de tema claro.
@@ -148,8 +150,9 @@ incorporar nuevos períodos.
 
 ## Reglas salariales
 
-La cobertura inicial corresponde a Argentina durante 2026. Los parámetros
-legales viven en `src/lib/rules` e incluyen:
+La cobertura histórica corresponde a Argentina desde enero de 2019 hasta el
+último período oficial confirmado. Los parámetros legales viven en
+`src/lib/rules` e incluyen:
 
 - Período de vigencia.
 - Porcentajes generales de aportes.
@@ -159,6 +162,13 @@ legales viven en `src/lib/rules` e incluyen:
 
 Las fuentes primarias utilizadas deben ser ARCA, ANSES, el Boletín Oficial u
 otros organismos públicos competentes.
+
+Ganancias se resuelve por la fecha de pago usando las tablas históricas de
+ARCA; los aportes se resuelven por período devengado usando las bases
+imponibles publicadas por ANSES. La aplicación valida que no falte ningún mes
+en la serie. Los recibos anteriores a 2019 se pueden leer, pero no se convierten
+en cálculos. Los períodos posteriores al último confirmado usan la última regla
+disponible y se identifican expresamente como estimados.
 
 ### Actualizar una regla
 

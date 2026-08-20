@@ -1,5 +1,75 @@
 import { expect, test } from "@playwright/test";
 
+function pdfFromLines(lines: string[]) {
+  const content = lines.join("\n");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  pdf += offsets
+    .slice(1)
+    .map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`)
+    .join("");
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf);
+}
+
+function paystubPdf() {
+  return pdfFromLines([
+    "BT /F1 10 Tf",
+    "1 0 0 1 30 760 Tm (PERIODO AGOSTO 2026) Tj",
+    "1 0 0 1 30 720 Tm (REMUNERATIVO) Tj",
+    "1 0 0 1 30 700 Tm (001 SUELDO BASICO) Tj",
+    "1 0 0 1 400 700 Tm (1.000.000,00) Tj",
+    "1 0 0 1 30 680 Tm (002 PREMIO PRODUCTIVIDAD) Tj",
+    "1 0 0 1 400 680 Tm (50.000,00) Tj",
+    "1 0 0 1 30 640 Tm (DEDUCCIONES) Tj",
+    "1 0 0 1 30 620 Tm (101 JUBILACION) Tj",
+    "1 0 0 1 400 620 Tm (110.000,00) Tj",
+    "1 0 0 1 30 600 Tm (102 CUOTA SINDICAL) Tj",
+    "1 0 0 1 400 600 Tm (10.000,00) Tj",
+    "1 0 0 1 30 560 Tm (NETO A COBRAR) Tj",
+    "1 0 0 1 400 560 Tm (930.000,00) Tj ET",
+  ]);
+}
+
+function mixedSacPaystubPdf() {
+  return pdfFromLines([
+    "BT /F1 10 Tf",
+    "1 0 0 1 30 780 Tm (PERIODO JUNIO 2024) Tj",
+    "1 0 0 1 30 750 Tm (REMUNERATIVO) Tj",
+    "1 0 0 1 30 730 Tm (001 S.A.C.) Tj",
+    "1 0 0 1 400 730 Tm (530.024,00) Tj",
+    "1 0 0 1 30 700 Tm (NO REMUNERATIVO) Tj",
+    "1 0 0 1 30 680 Tm (002 SAC S/INCREMENTO N/REM) Tj",
+    "1 0 0 1 400 680 Tm (47.414,00) Tj",
+    "1 0 0 1 30 650 Tm (DEDUCCIONES) Tj",
+    "1 0 0 1 30 630 Tm (101 JUBILACION) Tj",
+    "1 0 0 1 400 630 Tm (58.302,64) Tj",
+    "1 0 0 1 30 610 Tm (102 LEY 19.032 3 %) Tj",
+    "1 0 0 1 400 610 Tm (15.900,72) Tj",
+    "1 0 0 1 30 590 Tm (103 S.E.C. 2%) Tj",
+    "1 0 0 1 400 590 Tm (11.548,76) Tj",
+    "1 0 0 1 30 570 Tm (104 F.A.E.C.Y.S. 0.5%) Tj",
+    "1 0 0 1 400 570 Tm (2.887,19) Tj",
+    "1 0 0 1 30 550 Tm (105 OSECAC-OS DE LOS EMPLEADOS DE) Tj",
+    "1 0 0 1 400 550 Tm (17.323,14) Tj",
+    "1 0 0 1 30 510 Tm (NETO A COBRAR) Tj",
+    "1 0 0 1 400 510 Tm (471.475,55) Tj ET",
+  ]);
+}
+
 test("hydrates persisted theme and scenarios without React errors", async ({
   page,
 }) => {
@@ -50,7 +120,7 @@ test("hydrates persisted theme and scenarios without React errors", async ({
 
 test("starts dark and calculates salary with shadcn controls", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.clock.setFixedTime(new Date("2026-08-13T12:00:00"));
   await page.goto("./");
   await expect(page.locator("html")).toHaveClass(/dark/);
@@ -67,7 +137,17 @@ test("starts dark and calculates salary with shadcn controls", async ({
     page.getByRole("button", { name: "Seleccionar período" }),
   ).toContainText("agosto de 2026");
   await page.getByRole("button", { name: "Seleccionar período" }).click();
-  await expect(page.getByRole("button", { name: "sep." })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "sep." })).toBeEnabled();
+  await page.getByRole("button", { name: "sep." }).click();
+  await expect(page.getByText("Cálculo con reglas estimadas")).toBeVisible();
+  await page.getByRole("button", { name: "Seleccionar período" }).click();
+  await page.getByRole("combobox", { name: "Año del período" }).click();
+  await page.getByRole("option", { name: "2019" }).click();
+  await page.getByRole("button", { name: "ene." }).click();
+  await expect(page.getByText("Reglas 2019-01")).toBeVisible();
+  await page.getByRole("button", { name: "Seleccionar período" }).click();
+  await page.getByRole("combobox", { name: "Año del período" }).click();
+  await page.getByRole("option", { name: "2026" }).click();
   await page.getByRole("button", { name: "ago." }).click();
   await expect(
     page.getByRole("button", { name: "Seleccionar período" }),
@@ -96,10 +176,14 @@ test("starts dark and calculates salary with shadcn controls", async ({
   await expect(
     page.getByRole("button", { name: "Más información sobre Sueldo básico" }),
   ).toHaveCount(0);
-  await page.getByText("Sueldo básico", { exact: true }).hover({ force: true });
-  await expect(page.getByRole("tooltip")).toContainText(
-    "Importe mensual bruto",
-  );
+  if (testInfo.project.name === "desktop") {
+    await page
+      .locator('label[for="scenario-basicSalary"]')
+      .hover({ force: true });
+    await expect(page.getByRole("tooltip")).toContainText(
+      "Importe mensual bruto",
+    );
+  }
 
   await page.getByRole("radio", { name: "Neto → bruto" }).click();
   await expect(page.getByText("Sueldo bruto estimado")).toBeVisible();
@@ -132,7 +216,7 @@ test("shows version, credit and stays within a mobile viewport", async ({
   await page.setViewportSize({ width: 375, height: 812 });
   await page.goto("./");
 
-  await expect(page.getByText("v1.0.1")).toBeVisible();
+  await expect(page.getByText("v1.1.0")).toBeVisible();
   await expect(page.getByRole("link", { name: "Lukas Otero" })).toHaveAttribute(
     "href",
     "https://www.linkedin.com/in/lukas-otero/",
@@ -172,13 +256,20 @@ test("does not duplicate and confirms deletion of unnamed saved scenarios", asyn
   await expect(page.getByRole("button", { name: "Guardado" })).toBeVisible();
   await page.getByRole("tab", { name: /Escenarios/ }).click();
 
-  await expect(page.getByText("Bruto", { exact: true })).toBeVisible();
-  await expect(page.getByText("Deducciones", { exact: true })).toBeVisible();
+  await expect(page.getByText("Bruto", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByText("Deducciones", { exact: true }).first(),
+  ).toBeVisible();
   await expect(
     page.getByRole("textbox", { name: "Nombre del escenario" }),
   ).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Duplicar" })).toHaveCount(0);
-  await expect(page.getByText("Neto estimado")).toHaveCount(1);
+  await expect(
+    page.getByRole("button", { name: /Ver detalle de Agosto de 2026/ }),
+  ).toHaveAttribute("aria-expanded", "false");
+  await page
+    .getByRole("button", { name: /Ver detalle de Agosto de 2026/ })
+    .click();
 
   await page
     .getByRole("button", { name: "Eliminar escenario de Agosto de 2026" })
@@ -195,7 +286,7 @@ test("does not duplicate and confirms deletion of unnamed saved scenarios", asyn
     .first()
     .click();
   await dialog.getByRole("button", { name: "Eliminar escenario" }).click();
-  await expect(page.getByText("Neto estimado")).toHaveCount(0);
+  await expect(page.getByText("Todavía no guardaste escenarios")).toBeVisible();
 });
 
 test("merges an individual SAC into a monthly scenario", async ({ page }) => {
@@ -241,6 +332,42 @@ test("merges an individual SAC into a monthly scenario", async ({ page }) => {
   });
   await page.goto("./");
   await page.getByRole("tab", { name: "Escenarios · 2" }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Filtrar escenarios por año" }),
+  ).toContainText("Todos los años");
+  await page
+    .getByRole("combobox", { name: "Filtrar escenarios por año" })
+    .click();
+  await page.getByRole("option", { name: "2026" }).click();
+  await page.getByRole("radio", { name: "SAC", exact: true }).click();
+  await expect(page.getByText("1 de 2 escenarios")).toBeVisible();
+  await expect(page.getByText("SAC individual")).toBeVisible();
+  await page.getByRole("tab", { name: "Calculadora", exact: true }).click();
+  await page.getByRole("tab", { name: "Escenarios · 2" }).click();
+  await expect(
+    page.getByRole("radio", { name: "SAC", exact: true }),
+  ).toBeChecked();
+  await expect(page.getByText("1 de 2 escenarios")).toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "Escenarios · 2" }).click();
+  await expect(
+    page.getByRole("radio", { name: "SAC", exact: true }),
+  ).toBeChecked();
+  await expect(page.getByText("1 de 2 escenarios")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        JSON.parse(
+          localStorage.getItem("salary-scenario-filters:v1") ?? "null",
+        ),
+      ),
+    )
+    .toEqual({ year: "2026", type: "sac" });
+  await page.getByRole("radio", { name: "Todos", exact: true }).click();
+  await page
+    .getByRole("button", { name: /Ver detalle de Junio de 2026/ })
+    .nth(1)
+    .click();
   await page
     .getByRole("button", { name: "Unir con escenario mensual" })
     .click();
@@ -265,6 +392,62 @@ test("merges an individual SAC into a monthly scenario", async ({ page }) => {
     sourcePaystubIds: ["monthly-file", "sac-file"],
     exchangeRate: { rate: 1400, date: "2026-06-30", source: "BCRA" },
   });
+  await page.getByRole("radio", { name: "SAC", exact: true }).click();
+  await expect(page.getByText("1 de 1 escenarios")).toBeVisible();
+  await expect(page.getByText("Incluye SAC", { exact: true })).toBeVisible();
+});
+
+test("filters vacation receipts and keeps the filter after reloading", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const base = {
+      period: "2025-07",
+      basicSalary: 0,
+      seniority: 0,
+      overtime50Hours: 0,
+      overtime100Hours: 0,
+      holidayHours: 0,
+      commissions: 0,
+      bonuses: 0,
+      nonRemunerative: 24_509.21,
+      reimbursements: 0,
+      sac: 0,
+      vacation: 628_444.09,
+      unionMode: "fixed",
+      unionValue: 16_323.81,
+      spouse: false,
+      children: 0,
+      otherDeductions: 1,
+      ytd: { taxableIncome: 0, generalDeductions: 0, withheldTax: 0 },
+      sourcePaystubIds: ["vacation-paystub"],
+    };
+    localStorage.setItem(
+      "salary-scenarios:v1",
+      JSON.stringify([
+        { ...base, id: "vacation", scenarioType: "vacation" },
+        {
+          ...base,
+          id: "monthly",
+          basicSalary: 1_000_000,
+          vacation: 0,
+          scenarioType: "salary",
+        },
+      ]),
+    );
+  });
+  await page.goto("./");
+  await page.getByRole("tab", { name: "Escenarios · 2" }).click();
+  await page.getByRole("radio", { name: "Vacaciones", exact: true }).click();
+  await expect(page.getByText("1 de 2 escenarios")).toBeVisible();
+  await expect(
+    page.getByText("Vacaciones", { exact: true }).last(),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "Escenarios · 2" }).click();
+  await expect(
+    page.getByRole("radio", { name: "Vacaciones", exact: true }),
+  ).toBeChecked();
 });
 
 test("shows the official USD conversion and frozen salary history", async ({
@@ -318,7 +501,7 @@ test("shows the official USD conversion and frozen salary history", async ({
   ).toBeVisible();
   await expect(
     page.getByText(
-      "Si guardaste más de un escenario para el mismo mes, mostramos el promedio.",
+      "Los recibos guardados del mismo mes se suman. Las simulaciones manuales se promedian sólo cuando ese mes no tiene recibos.",
     ),
   ).toBeVisible();
   await page.getByRole("radio", { name: "Dólares" }).click();
@@ -330,6 +513,9 @@ test("shows the official USD conversion and frozen salary history", async ({
       "La serie usa la cotización congelada al guardar cada escenario.",
     ),
   ).toBeVisible();
+  await page
+    .getByRole("button", { name: /Ver detalle de Agosto de 2026/ })
+    .click();
   await expect(
     page.getByText(
       "Conversión calculada con la cotización disponible al guardar el escenario.",
@@ -396,6 +582,9 @@ test("updates legacy scenarios with the historical month close", async ({
 
   await page.goto("./");
   await page.getByRole("tab", { name: "Escenarios · 1" }).click();
+  await page
+    .getByRole("button", { name: /Ver detalle de Junio de 2026/ })
+    .click();
   await expect(
     page.getByText("Cotización de cierre del período."),
   ).toBeVisible();
@@ -436,4 +625,159 @@ test("shows drag state and validates dropped files", async ({ page }) => {
   await expect(
     page.getByRole("alert").filter({ hasText: "No pudimos leer el archivo" }),
   ).toContainText("Usá archivos PDF de hasta 10 MB.");
+});
+
+test("classifies, excludes and persists receipt concepts", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop",
+    "Covered once in the desktop flow",
+  );
+  await page.goto("./");
+  const reviewTab = page.getByRole("tab", { name: "Revisar recibo" });
+  await expect
+    .poll(() =>
+      reviewTab.evaluate((element) =>
+        Object.keys(element).some((key) => key.startsWith("__reactProps")),
+      ),
+    )
+    .toBe(true);
+  await reviewTab.click();
+  await expect(reviewTab).toHaveAttribute("data-state", "active");
+  await page.getByLabel("Seleccionar recibos de sueldo en PDF").setInputFiles({
+    name: "recibo-agosto-2026.pdf",
+    mimeType: "application/pdf",
+    buffer: paystubPdf(),
+  });
+
+  await expect(page.getByText("SUELDO BASICO", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Clasificación pendiente de revisión"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("combobox", { name: "Naturaleza de SUELDO BASICO" }),
+  ).toHaveText("Sueldo básico");
+  await page
+    .getByRole("combobox", { name: "Naturaleza de SUELDO BASICO" })
+    .click();
+  const natureList = page.getByRole("listbox");
+  await expect(natureList).toBeVisible();
+  expect((await natureList.boundingBox())?.height).toBeLessThanOrEqual(288);
+  expect(
+    await natureList
+      .locator("[data-radix-select-viewport]")
+      .evaluate((element) => element.scrollHeight > element.clientHeight),
+  ).toBe(true);
+  await page.keyboard.press("Escape");
+  await page
+    .getByRole("checkbox", {
+      name: "Incluir PREMIO PRODUCTIVIDAD en el cálculo",
+    })
+    .click();
+  await page
+    .getByRole("combobox", { name: "Tratamiento de SUELDO BASICO" })
+    .click();
+  await page.getByRole("option", { name: "No remunerativo" }).click();
+  await expect(
+    page.getByText("No remunerativos", { exact: true }).locator(".."),
+  ).toContainText("1.000.000");
+
+  await expect(
+    page.getByRole("button", { name: "Usar valores detectados" }),
+  ).toBeDisabled();
+  await page
+    .getByRole("checkbox", {
+      name: "Confirmar que revisé las diferencias",
+    })
+    .click();
+  await page.getByRole("button", { name: "Usar valores detectados" }).click();
+  await expect(page.getByRole("tab", { name: "Escenarios · 1" })).toBeVisible();
+  await expect(page.locator('[data-view-panel="saved"]')).toHaveClass(
+    /view-panel-enter/,
+  );
+  const chartHeading = page.getByRole("heading", {
+    name: "Tu sueldo neto en el tiempo",
+  });
+  await expect(chartHeading).toBeVisible();
+  await expect
+    .poll(async () => {
+      const box = await chartHeading.boundingBox();
+      return box != null && box.y >= 0 && box.y < 1080;
+    })
+    .toBe(true);
+  await page
+    .getByRole("button", { name: /Ver detalle de Agosto de 2026/ })
+    .click();
+  await expect(page.getByText("4 conceptos del recibo")).toBeVisible();
+  await expect(page.getByText("PREMIO PRODUCTIVIDAD")).toBeVisible();
+  await expect(
+    page.getByText(/Bono \/ premio · Remunerativo · Excluido/),
+  ).toBeVisible();
+  const saved = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("salary-scenarios:v1") ?? "[]"),
+  );
+  expect(saved[0].sourceConcepts).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        name: "SUELDO BASICO",
+        nature: "basic-salary",
+        treatment: "non-remunerative",
+      }),
+      expect.objectContaining({
+        name: "PREMIO PRODUCTIVIDAD",
+        selected: false,
+      }),
+    ]),
+  );
+  expect(saved[0].sourceReconciliation).toMatchObject({
+    status: "mismatch",
+    confirmed: true,
+  });
+});
+
+test("imports a mixed SAC without leaking the calculator demo salary", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop",
+    "Covered once in the desktop flow",
+  );
+  await page.goto("./");
+  const reviewTab = page.getByRole("tab", { name: "Revisar recibo" });
+  await expect
+    .poll(() =>
+      reviewTab.evaluate((element) =>
+        Object.keys(element).some((key) => key.startsWith("__reactProps")),
+      ),
+    )
+    .toBe(true);
+  await reviewTab.click();
+  await expect(reviewTab).toHaveAttribute("data-state", "active");
+  await page.getByLabel("Seleccionar recibos de sueldo en PDF").setInputFiles({
+    name: "sac-junio-2024.pdf",
+    mimeType: "application/pdf",
+    buffer: mixedSacPaystubPdf(),
+  });
+
+  await expect(page.getByText("S.A.C.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Revisá Jubilación")).toHaveCount(0);
+  await expect(page.getByText("Revisá Obra social")).toHaveCount(0);
+  await expect(page.getByText("Revisá PAMI")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Usar valores detectados" }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Usar valores detectados" }).click();
+  await expect(page.getByRole("tab", { name: "Escenarios · 1" })).toBeVisible();
+
+  const saved = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("salary-scenarios:v1") ?? "[]"),
+  );
+  expect(saved[0]).toMatchObject({
+    period: "2024-06",
+    basicSalary: 0,
+    sac: 530_024,
+    nonRemunerative: 47_414,
+    scenarioType: "sac",
+  });
 });

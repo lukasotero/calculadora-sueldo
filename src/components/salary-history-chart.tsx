@@ -58,7 +58,7 @@ function renderHistoryDot({
 }) {
   if (cx == null || cy == null) return <></>;
 
-  return payload?.hasSac ? (
+  return payload?.hasSac || payload?.hasVacation ? (
     <g aria-hidden="true">
       <circle
         cx={cx}
@@ -158,6 +158,12 @@ const SalaryAreaVisualization = dynamic(
                       const hasSac = item.payload.hasSac as boolean | undefined;
                       const sacScenarioCount = item.payload.sacScenarioCount as
                         number | undefined;
+                      const hasVacation = item.payload.hasVacation as
+                        boolean | undefined;
+                      const aggregation = item.payload.aggregation as
+                        "sum" | "average" | undefined;
+                      const receiptCount = item.payload.receiptCount as
+                        number | undefined;
                       return (
                         <div className="flex min-w-40 flex-col gap-1">
                           <span className="font-mono font-semibold tabular-nums text-foreground">
@@ -193,7 +199,17 @@ const SalaryAreaVisualization = dynamic(
                                 : ""}
                             </span>
                           ) : null}
-                          {scenarioCount && scenarioCount > 1 ? (
+                          {hasVacation ? (
+                            <span className="font-medium text-foreground">
+                              Incluye vacaciones
+                            </span>
+                          ) : null}
+                          {aggregation === "sum" ? (
+                            <span className="text-muted-foreground">
+                              Total de {receiptCount}{" "}
+                              {receiptCount === 1 ? "recibo" : "recibos"}
+                            </span>
+                          ) : scenarioCount && scenarioCount > 1 ? (
                             <span className="text-muted-foreground">
                               Promedio de {scenarioCount} escenarios
                             </span>
@@ -240,10 +256,7 @@ export function SalaryHistoryChart({
     [currency, scenarios],
   );
   const missingUsd =
-    currency === "USD" &&
-    scenarios.some(
-      (scenario) => scenario.scenarioType !== "sac" && !scenario.exchangeRate,
-    );
+    currency === "USD" && scenarios.some((scenario) => !scenario.exchangeRate);
   const chartConfig = {
     value: {
       label: currency === "ARS" ? "Neto en pesos" : "Neto en dólares",
@@ -298,7 +311,7 @@ export function SalaryHistoryChart({
               >
                 <span className="size-1.5 rounded-full bg-primary" />
               </span>
-              Punto marcado: el escenario mensual incluye SAC.
+              Punto marcado: el total mensual incluye SAC o vacaciones.
             </div>
             {points.length === 1 ? (
               <p className="mt-3 text-sm text-muted-foreground">
@@ -315,8 +328,8 @@ export function SalaryHistoryChart({
         )}
         <div className="mt-4 flex flex-col gap-1 text-xs leading-5 text-muted-foreground">
           <p>
-            Si guardaste más de un escenario para el mismo mes, mostramos el
-            promedio.
+            Los recibos guardados del mismo mes se suman. Las simulaciones
+            manuales se promedian sólo cuando ese mes no tiene recibos.
           </p>
           {currency === "USD" ? (
             <p>
@@ -325,8 +338,8 @@ export function SalaryHistoryChart({
           ) : null}
           {missingUsd ? (
             <p>
-              Los escenarios sin cotización guardada no se incluyen en la vista
-              en dólares.
+              Si a un recibo le falta su cotización, omitimos el mes completo en
+              dólares para evitar un total parcial.
             </p>
           ) : null}
         </div>

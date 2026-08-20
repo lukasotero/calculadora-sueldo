@@ -48,7 +48,6 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -105,20 +104,33 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { auditPaystub, parsePaystub } from "@/lib/paystub-parser";
+import {
+  auditPaystub,
+  conceptsFromPaystub,
+  isPaystubAmountWithinTolerance,
+  migrateStoredConcepts,
+  parsePaystub,
+  paystubReconciliationReference,
+  reconcilePaystub,
+} from "@/lib/paystub-parser";
 import { mergeSacScenario, scenarioFromPaystub } from "@/lib/scenario-merge";
 import {
   calculateNetToGross,
   calculateSalary,
   defaultScenario,
 } from "@/lib/salary-engine";
+import { EARLIEST_SUPPORTED_PERIOD, resolveRules } from "@/lib/rules/argentina";
 import {
   convertArsToUsd,
   migrateHistoricalExchangeRates,
 } from "@/lib/exchange-rate";
 import { useExchangeRate } from "@/hooks/use-exchange-rate";
 import type {
+  AuditFinding,
   ExchangeRateSnapshot,
+  ConceptNature,
+  ConceptTreatment,
+  PaystubConcept,
   ParsedPaystub,
   SalaryScenario,
 } from "@/lib/types";
@@ -126,14 +138,82 @@ import { cn, formatDate, money, usdMoney } from "@/lib/utils";
 
 type View = "calculator" | "receipt" | "saved";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type PaystubActionStatus =
+  "idle" | "saving" | "saved" | "error" | "verifying" | "verified";
 type HistoricalUpdateStatus = "idle" | "updating" | "pending";
 type ScenarioUpdater = <K extends keyof SalaryScenario>(
   key: K,
   value: SalaryScenario[K],
 ) => void;
+
+const conceptNatureLabels: Record<ConceptNature, string> = {
+  "basic-salary": "Sueldo básico",
+  seniority: "Antigüedad",
+  "overtime-50": "Horas extra 50%",
+  "overtime-100": "Horas extra 100%",
+  holiday: "Feriado",
+  commission: "Comisión",
+  bonus: "Bono / premio",
+  attendance: "Presentismo",
+  advance: "Anticipo",
+  "agreement-adjustment": "Ajuste de convenio",
+  rounding: "Redondeo",
+  vacation: "Vacaciones",
+  sac: "SAC / aguinaldo",
+  "other-earning": "Otro haber",
+  reimbursement: "Reintegro",
+  pension: "Jubilación",
+  health: "Obra social",
+  pami: "PAMI",
+  "income-tax": "Ganancias",
+  union: "Sindicato",
+  "other-deduction": "Otro descuento",
+  informational: "Informativo",
+};
+const conceptTreatmentLabels: Record<ConceptTreatment, string> = {
+  remunerative: "Remunerativo",
+  "non-remunerative": "No remunerativo",
+  deduction: "Deducción",
+  informational: "Informativo",
+};
 const STORAGE_KEY = "salary-scenarios:v1";
 const STORAGE_EVENT = "salary-scenarios-change";
+const SCENARIO_FILTERS_KEY = "salary-scenario-filters:v1";
 const EMPTY_SCENARIOS: SalaryScenario[] = [];
+type ScenarioTypeFilter = "all" | "salary" | "sac" | "vacation";
+type ScenarioFilters = { year: string; type: ScenarioTypeFilter };
+const DEFAULT_SCENARIO_FILTERS: ScenarioFilters = { year: "all", type: "all" };
+
+function readScenarioFilters(): ScenarioFilters {
+  if (typeof window === "undefined") return DEFAULT_SCENARIO_FILTERS;
+  try {
+    const stored = JSON.parse(
+      localStorage.getItem(SCENARIO_FILTERS_KEY) ?? "null",
+    ) as Partial<ScenarioFilters> | null;
+    const storedYear = stored?.year;
+    const year =
+      storedYear === "all" ||
+      (typeof storedYear === "string" && /^20\d{2}$/.test(storedYear))
+        ? storedYear
+        : "all";
+    const type = ["all", "salary", "sac", "vacation"].includes(
+      stored?.type ?? "",
+    )
+      ? (stored?.type as ScenarioTypeFilter)
+      : "all";
+    return { year, type };
+  } catch {
+    return DEFAULT_SCENARIO_FILTERS;
+  }
+}
+
+function writeScenarioFilters(filters: ScenarioFilters) {
+  try {
+    localStorage.setItem(SCENARIO_FILTERS_KEY, JSON.stringify(filters));
+  } catch {
+    // Filtering remains usable for the current session when storage is blocked.
+  }
+}
 let savedSnapshotRaw: string | undefined;
 let savedSnapshot: SalaryScenario[] = EMPTY_SCENARIOS;
 
@@ -148,7 +228,15 @@ function getSavedSnapshot() {
   savedSnapshotRaw = raw ?? undefined;
   try {
     savedSnapshot = raw
-      ? (JSON.parse(raw) as SalaryScenario[])
+      ? (JSON.parse(raw) as SalaryScenario[]).map((scenario) => ({
+          ...scenario,
+          reimbursements: scenario.reimbursements ?? 0,
+          vacation: scenario.vacation ?? 0,
+          sourceConcepts: migrateStoredConcepts(scenario.sourceConcepts),
+          rulesResolution:
+            scenario.rulesResolution ??
+            resolveRules(scenario.period, scenario.paymentDate),
+        }))
       : EMPTY_SCENARIOS;
   } catch {
     savedSnapshot = EMPTY_SCENARIOS;
@@ -191,7 +279,9 @@ const numericFields = [
   ["commissions", "Comisiones", "Importe remunerativo"],
   ["bonuses", "Bonos", "Importe remunerativo"],
   ["nonRemunerative", "No remunerativo", "Importe sin aportes"],
+  ["reimbursements", "Reintegros", "Suman al neto sin integrar bases"],
   ["sac", "SAC / aguinaldo", "Importe remunerativo"],
+  ["vacation", "Vacaciones", "Importe remunerativo"],
   ["otherDeductions", "Otras deducciones", undefined],
 ] as const;
 const saveLabels: Record<SaveStatus, string> = {
@@ -224,8 +314,51 @@ function exchangeRateDescription(snapshot: ExchangeRateSnapshot) {
   return "Conversión calculada con la cotización disponible al guardar el escenario.";
 }
 
+function displayedConfidence(item: PaystubConcept) {
+  if (
+    item.evidence.confidence === "low" ||
+    item.classificationConfidence === "low"
+  )
+    return "low";
+  if (
+    item.evidence.confidence === "medium" ||
+    item.classificationConfidence === "medium"
+  )
+    return "medium";
+  return "high";
+}
+
+function motionDelay(duration: number) {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ? 0
+    : duration;
+}
+
+async function saveParsedPaystub(parsed: ParsedPaystub) {
+  const nextScenario = scenarioFromPaystub(
+    { ...defaultScenario, id: crypto.randomUUID() },
+    parsed,
+  );
+  try {
+    const currentSaved = getSavedSnapshot();
+    writeSavedSnapshot([
+      ...currentSaved.filter(
+        (item) => !item.sourcePaystubIds?.includes(parsed.id),
+      ),
+      {
+        ...nextScenario,
+        rulesResolution: calculateSalary(nextScenario).rulesResolution,
+      },
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function SalaryCalculator() {
   const calculator = useSalaryCalculator();
+  const viewPanelRef = useRef<HTMLDivElement>(null);
   const {
     view,
     setView,
@@ -252,7 +385,10 @@ export function SalaryCalculator() {
     mergeSavedSac,
     uploadFiles,
     applyPaystub,
-    updatePaystubDestination,
+    savePaystub,
+    finishSavingPaystub,
+    updatePaystubConcept,
+    confirmPaystubReconciliation,
     exchangeRate,
     historicalUpdateStatus,
     historicalPendingCount,
@@ -265,6 +401,17 @@ export function SalaryCalculator() {
     scenario.ytd.generalDeductions > 0 ||
     scenario.ytd.withheldTax > 0;
   const showIncomeTax = result.mayPayIncomeTax || hasIncomeTaxData;
+  const completePaystubSave = (paystubId: string) => {
+    finishSavingPaystub(paystubId);
+    requestAnimationFrame(() => {
+      viewPanelRef.current?.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "auto"
+          : "smooth",
+        block: "start",
+      });
+    });
+  };
 
   return (
     <>
@@ -274,113 +421,135 @@ export function SalaryCalculator() {
         onChange={setView}
       />
 
-      {view === "calculator" && (
-        <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,.8fr)] xl:gap-8">
-          <Card className="min-w-0">
-            <CardHeader>
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <CardTitle>Armá tu cálculo</CardTitle>
-                  <CardDescription className="mt-1">
-                    Todos los importes están expresados en pesos argentinos.
-                  </CardDescription>
+      <div
+        key={view}
+        ref={viewPanelRef}
+        data-view-panel={view}
+        className="view-panel-enter scroll-mt-24"
+      >
+        {view === "calculator" && (
+          <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,.8fr)] xl:gap-8">
+            <Card className="min-w-0">
+              <CardHeader>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <CardTitle>Armá tu cálculo</CardTitle>
+                    <CardDescription className="mt-1">
+                      Todos los importes están expresados en pesos argentinos.
+                    </CardDescription>
+                  </div>
+                  <Badge
+                    variant={
+                      result.rulesResolution.status === "exact"
+                        ? "default"
+                        : "outline"
+                    }
+                  >
+                    {result.rulesResolution.status === "exact"
+                      ? `Reglas ${result.rulesResolution.contributionPeriod}`
+                      : result.rulesResolution.status === "estimated"
+                        ? "Reglas estimadas"
+                        : "Sin cálculo disponible"}
+                  </Badge>
                 </div>
-                <Badge>Reglas 2026</Badge>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <FieldGroup>
-                <ToggleGroup
-                  type="single"
-                  value={mode}
-                  onValueChange={(value) => {
-                    if (value) setMode(value as "gross" | "net");
-                  }}
-                  className="grid min-w-0 grid-cols-2 rounded-xl bg-muted p-1"
-                  aria-label="Dirección del cálculo"
-                >
-                  <ToggleGroupItem
-                    value="gross"
-                    className="min-h-11 min-w-0 px-1.5 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground min-[360px]:px-2 min-[360px]:text-sm"
+              </CardHeader>
+              <CardContent>
+                <FieldGroup>
+                  <ToggleGroup
+                    type="single"
+                    value={mode}
+                    onValueChange={(value) => {
+                      if (value) setMode(value as "gross" | "net");
+                    }}
+                    className="grid min-w-0 grid-cols-2 rounded-xl bg-muted p-1"
+                    aria-label="Dirección del cálculo"
                   >
-                    Bruto → neto
-                  </ToggleGroupItem>
-                  <ToggleGroupItem
-                    value="net"
-                    className="min-h-11 min-w-0 px-1.5 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground min-[360px]:px-2 min-[360px]:text-sm"
-                  >
-                    Neto → bruto
-                  </ToggleGroupItem>
-                </ToggleGroup>
-                {mode === "net" ? (
-                  <NetSalaryFields
-                    scenario={scenario}
-                    targetNet={targetNet}
-                    unionEnabled={unionEnabled}
-                    onTargetNetChange={setTargetNet}
-                    onUnionEnabledChange={setUnionEnabled}
-                    onUpdate={update}
+                    <ToggleGroupItem
+                      value="gross"
+                      className="min-h-11 min-w-0 px-1.5 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground min-[360px]:px-2 min-[360px]:text-sm"
+                    >
+                      Bruto → neto
+                    </ToggleGroupItem>
+                    <ToggleGroupItem
+                      value="net"
+                      className="min-h-11 min-w-0 px-1.5 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground min-[360px]:px-2 min-[360px]:text-sm"
+                    >
+                      Neto → bruto
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                  {mode === "net" ? (
+                    <NetSalaryFields
+                      scenario={scenario}
+                      targetNet={targetNet}
+                      unionEnabled={unionEnabled}
+                      onTargetNetChange={setTargetNet}
+                      onUnionEnabledChange={setUnionEnabled}
+                      onUpdate={update}
+                    />
+                  ) : (
+                    <GrossSalaryFields scenario={scenario} onUpdate={update} />
+                  )}
+                  {mode === "gross" && showIncomeTax && (
+                    <IncomeTaxFields scenario={scenario} onUpdate={update} />
+                  )}
+                  <CalculatorActions
+                    saveStatus={saveStatus}
+                    onSave={saveScenario}
+                    disabled={result.rulesResolution.status === "unsupported"}
+                    onReset={() =>
+                      setScenario({
+                        ...defaultScenario,
+                        id: crypto.randomUUID(),
+                      })
+                    }
                   />
-                ) : (
-                  <GrossSalaryFields scenario={scenario} onUpdate={update} />
-                )}
-                {mode === "gross" && showIncomeTax && (
-                  <IncomeTaxFields scenario={scenario} onUpdate={update} />
-                )}
-                <CalculatorActions
-                  saveStatus={saveStatus}
-                  onSave={saveScenario}
-                  onReset={() =>
-                    setScenario({
-                      ...defaultScenario,
-                      id: crypto.randomUUID(),
-                    })
-                  }
-                />
-              </FieldGroup>
-            </CardContent>
-          </Card>
-          <ResultPanel
-            result={result}
-            mode={mode}
-            targetNet={targetNet}
-            exchangeRate={exchangeRate}
+                </FieldGroup>
+              </CardContent>
+            </Card>
+            <ResultPanel
+              result={result}
+              mode={mode}
+              targetNet={targetNet}
+              exchangeRate={exchangeRate}
+            />
+          </div>
+        )}
+
+        {view === "receipt" && (
+          <ReceiptView
+            inputRef={inputRef}
+            loading={loading}
+            uploadError={uploadError}
+            uploadNotice={uploadNotice}
+            paystubs={paystubs}
+            onUpload={uploadFiles}
+            onSave={savePaystub}
+            onSaveComplete={completePaystubSave}
+            onVerify={applyPaystub}
+            onConceptChange={updatePaystubConcept}
+            onReconciliationConfirm={confirmPaystubReconciliation}
+            onDelete={(id) =>
+              setPaystubs((current) => current.filter((item) => item.id !== id))
+            }
           />
-        </div>
-      )}
+        )}
 
-      {view === "receipt" && (
-        <ReceiptView
-          inputRef={inputRef}
-          loading={loading}
-          uploadError={uploadError}
-          uploadNotice={uploadNotice}
-          paystubs={paystubs}
-          result={result}
-          onUpload={uploadFiles}
-          onApply={applyPaystub}
-          onDestinationChange={updatePaystubDestination}
-          onDelete={(id) =>
-            setPaystubs((current) => current.filter((item) => item.id !== id))
-          }
-        />
-      )}
-
-      {view === "saved" && (
-        <SavedScenariosView
-          scenarios={saved}
-          onCreate={() => setView("calculator")}
-          onDelete={removeSaved}
-          onMergeSac={mergeSavedSac}
-          historicalUpdateStatus={historicalUpdateStatus}
-          historicalPendingCount={historicalPendingCount}
-          onRetryHistoricalRates={retryHistoricalRates}
-          onOpen={(item) => {
-            setScenario(item);
-            setView("calculator");
-          }}
-        />
-      )}
+        {view === "saved" && (
+          <SavedScenariosView
+            scenarios={saved}
+            onCreate={() => setView("calculator")}
+            onDelete={removeSaved}
+            onMergeSac={mergeSavedSac}
+            historicalUpdateStatus={historicalUpdateStatus}
+            historicalPendingCount={historicalPendingCount}
+            onRetryHistoricalRates={retryHistoricalRates}
+            onOpen={(item) => {
+              setScenario(item);
+              setView("calculator");
+            }}
+          />
+        )}
+      </div>
     </>
   );
 }
@@ -430,9 +599,8 @@ function NetSalaryFields({
                 <PeriodPicker
                   id="period"
                   value={scenario.period}
-                  minYear={2026}
-                  maxYear={2026}
-                  maxPeriod="2026-08"
+                  minYear={Number(EARLIEST_SUPPORTED_PERIOD.slice(0, 4))}
+                  maxYear={new Date().getFullYear()}
                   onValueChange={(value) => onUpdate("period", value)}
                 />
               </CalculatorField>
@@ -496,9 +664,8 @@ function GrossSalaryFields({
         <PeriodPicker
           id="period"
           value={scenario.period}
-          minYear={2026}
-          maxYear={2026}
-          maxPeriod="2026-08"
+          minYear={Number(EARLIEST_SUPPORTED_PERIOD.slice(0, 4))}
+          maxYear={new Date().getFullYear()}
           onValueChange={(value) => onUpdate("period", value)}
         />
       </CalculatorField>
@@ -665,17 +832,19 @@ function CalculatorActions({
   saveStatus,
   onSave,
   onReset,
+  disabled,
 }: {
   saveStatus: SaveStatus;
   onSave: () => Promise<void>;
   onReset: () => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-3 min-[420px]:flex-row min-[420px]:flex-wrap">
       <Button
         className="min-h-11 w-full min-[420px]:w-auto min-[420px]:min-w-44"
         variant={saveStatus === "error" ? "destructive" : "default"}
-        disabled={saveStatus === "saving"}
+        disabled={disabled || saveStatus === "saving"}
         onClick={() => void onSave()}
       >
         {saveIcons[saveStatus]}
@@ -796,6 +965,7 @@ function useSalaryCalculator() {
         ...scenario,
         id: crypto.randomUUID(),
         exchangeRate: exchangeRate.rate ?? scenario.exchangeRate,
+        rulesResolution: result.rulesResolution,
       },
     ];
     let resetDelay = 1500;
@@ -876,20 +1046,47 @@ function useSalaryCalculator() {
     setView("calculator");
   }
 
-  function updatePaystubDestination(
+  function finishSavingPaystub(paystubId: string) {
+    setPaystubs((current) =>
+      current.filter((paystub) => paystub.id !== paystubId),
+    );
+    setView("saved");
+  }
+
+  function updatePaystubConcept(
     paystubId: string,
     itemId: string,
-    destination: "salary" | "sac",
+    changes: Partial<Pick<PaystubConcept, "nature" | "treatment" | "selected">>,
   ) {
     setPaystubs((current) =>
       current.map((paystub) =>
         paystub.id === paystubId
           ? {
               ...paystub,
-              items: paystub.items.map((item) =>
-                item.id === itemId ? { ...item, destination } : item,
+              concepts: conceptsFromPaystub(paystub).map((item) =>
+                item.id === itemId
+                  ? {
+                      ...item,
+                      ...changes,
+                      classificationConfidence: changes.nature
+                        ? "high"
+                        : item.classificationConfidence,
+                    }
+                  : item,
               ),
+              items: [],
+              deductions: [],
             }
+          : paystub,
+      ),
+    );
+  }
+
+  function confirmPaystubReconciliation(paystubId: string, confirmed: boolean) {
+    setPaystubs((current) =>
+      current.map((paystub) =>
+        paystub.id === paystubId
+          ? { ...paystub, reconciliationConfirmed: confirmed }
           : paystub,
       ),
     );
@@ -921,7 +1118,10 @@ function useSalaryCalculator() {
     mergeSavedSac,
     uploadFiles,
     applyPaystub,
-    updatePaystubDestination,
+    savePaystub: saveParsedPaystub,
+    finishSavingPaystub,
+    updatePaystubConcept,
+    confirmPaystubReconciliation,
     exchangeRate,
     historicalUpdateStatus,
     historicalPendingCount,
@@ -974,10 +1174,12 @@ function ReceiptView({
   uploadError,
   uploadNotice,
   paystubs,
-  result,
   onUpload,
-  onApply,
-  onDestinationChange,
+  onSave,
+  onSaveComplete,
+  onVerify,
+  onConceptChange,
+  onReconciliationConfirm,
   onDelete,
 }: {
   inputRef: React.RefObject<HTMLInputElement | null>;
@@ -985,14 +1187,16 @@ function ReceiptView({
   uploadError?: string;
   uploadNotice?: string;
   paystubs: ParsedPaystub[];
-  result: ReturnType<typeof calculateSalary>;
   onUpload: (files: FileList | File[] | null) => Promise<void>;
-  onApply: (paystub: ParsedPaystub) => void;
-  onDestinationChange: (
+  onSave: (paystub: ParsedPaystub) => Promise<boolean>;
+  onSaveComplete: (paystubId: string) => void;
+  onVerify: (paystub: ParsedPaystub) => void;
+  onConceptChange: (
     paystubId: string,
     itemId: string,
-    destination: "salary" | "sac",
+    changes: Partial<Pick<PaystubConcept, "nature" | "treatment" | "selected">>,
   ) => void;
+  onReconciliationConfirm: (paystubId: string, confirmed: boolean) => void;
   onDelete: (id: string) => void;
 }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -1104,10 +1308,14 @@ function ReceiptView({
         <PaystubReview
           key={parsed.id}
           parsed={parsed}
-          result={result}
-          onApply={() => onApply(parsed)}
-          onDestinationChange={(itemId, destination) =>
-            onDestinationChange(parsed.id, itemId, destination)
+          onSave={() => onSave(parsed)}
+          onSaveComplete={() => onSaveComplete(parsed.id)}
+          onVerify={() => onVerify(parsed)}
+          onConceptChange={(itemId, changes) =>
+            onConceptChange(parsed.id, itemId, changes)
+          }
+          onReconciliationConfirm={(confirmed) =>
+            onReconciliationConfirm(parsed.id, confirmed)
           }
           onDelete={() => onDelete(parsed.id)}
         />
@@ -1158,6 +1366,233 @@ function HistoricalUpdateNotice({
   );
 }
 
+function SavedScenarioList({
+  filteredScenarios,
+  scenarios,
+  onOpen,
+  setMergeCandidate,
+  setMergeTargetId,
+  setDeleteCandidate,
+}: {
+  filteredScenarios: SalaryScenario[];
+  scenarios: SalaryScenario[];
+  onOpen: (scenario: SalaryScenario) => void;
+  setMergeCandidate: (scenario: SalaryScenario) => void;
+  setMergeTargetId: (targetId: string) => void;
+  setDeleteCandidate: (id: string) => void;
+}) {
+  return (
+    <>
+      <div className="overflow-hidden rounded-t-xl border-x border-t bg-card">
+        <div className="hidden grid-cols-[minmax(8rem,.8fr)_minmax(10rem,1.15fr)_minmax(8rem,.75fr)_minmax(8rem,.75fr)_auto_auto] items-center gap-3 border-b bg-muted/35 px-3 py-2 text-[11px] font-medium uppercase tracking-[.1em] text-muted-foreground sm:grid">
+          <span>Período</span>
+          <span>Neto</span>
+          <span>Bruto</span>
+          <span>Deducciones</span>
+          <span className="sr-only">Abrir</span>
+          <span className="sr-only">Detalle</span>
+        </div>
+      </div>
+      <Accordion
+        type="single"
+        collapsible
+        className="min-w-0 overflow-hidden rounded-b-xl border-x border-b bg-card"
+      >
+        {filteredScenarios.map((item) => {
+          const itemResult = calculateSalary(item);
+          const monthlyCandidates = scenarios.filter(
+            (candidate) =>
+              candidate.id !== item.id &&
+              (candidate.scenarioType == null ||
+                candidate.scenarioType === "salary") &&
+              candidate.period === item.period,
+          );
+          return (
+            <AccordionItem
+              key={item.id}
+              value={item.id}
+              className="overflow-hidden border-b px-0 transition-colors last:border-b-0 data-[state=open]:bg-muted/[.16]"
+            >
+              <div className="grid min-w-0 grid-cols-2 items-center gap-x-3 gap-y-2 p-3 sm:grid-cols-[minmax(8rem,.8fr)_minmax(10rem,1.15fr)_minmax(8rem,.75fr)_minmax(8rem,.75fr)_auto_auto] sm:gap-3">
+                <div className="col-span-2 flex min-w-0 flex-wrap items-center gap-1.5 sm:col-span-1">
+                  <Badge variant="outline">{formatPeriod(item.period)}</Badge>
+                  {item.sac > 0 ? (
+                    <Badge>
+                      {item.scenarioType === "sac"
+                        ? "SAC individual"
+                        : "Incluye SAC"}
+                    </Badge>
+                  ) : null}
+                  {item.scenarioType === "vacation" ? (
+                    <Badge>Vacaciones</Badge>
+                  ) : null}
+                </div>
+                <div className="col-span-2 min-w-0 sm:col-span-1">
+                  <p className="text-xs font-medium uppercase tracking-[.12em] text-muted-foreground">
+                    Neto
+                  </p>
+                  <p className="break-all font-mono text-xl font-bold tabular-nums text-primary">
+                    {money.format(itemResult.net)}
+                  </p>
+                </div>
+                <div className="min-w-0 border-l pl-3 sm:border-l-0 sm:pl-0">
+                  <p className="text-xs text-muted-foreground">Bruto</p>
+                  <p className="break-all font-mono text-sm font-semibold tabular-nums">
+                    {money.format(itemResult.gross)}
+                  </p>
+                </div>
+                <div className="min-w-0 border-l pl-3 sm:border-l-0 sm:pl-0">
+                  <p className="text-xs text-muted-foreground">Deducciones</p>
+                  <p className="break-all font-mono text-sm font-semibold tabular-nums">
+                    {money.format(itemResult.deductions)}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="min-h-9 w-full px-3 sm:w-auto"
+                  onClick={() => onOpen(item)}
+                >
+                  Abrir
+                </Button>
+                <AccordionTrigger
+                  aria-label={`Ver detalle de ${formatPeriod(item.period)} con neto ${money.format(itemResult.net)}`}
+                  className="min-h-9 w-full justify-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:no-underline sm:w-auto [&>svg]:size-3.5"
+                >
+                  Detalle
+                </AccordionTrigger>
+              </div>
+              <AccordionContent className="px-3 pb-3 pt-1">
+                <div className="grid gap-3 border-t pt-3 lg:grid-cols-2">
+                  <div className="flex min-w-0 flex-col gap-3">
+                    {item.exchangeRate ? (
+                      <div className="rounded-xl border border-primary/20 bg-primary/[.05] p-3">
+                        <p className="text-xs text-muted-foreground">
+                          Neto equivalente en dólares
+                        </p>
+                        <p className="mt-1 font-mono text-lg font-bold tabular-nums">
+                          {usdMoney.format(
+                            convertArsToUsd(
+                              itemResult.net,
+                              item.exchangeRate.rate,
+                            ) ?? 0,
+                          )}
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                          {exchangeRateDescription(item.exchangeRate)} · 1 USD ={" "}
+                          {money.format(item.exchangeRate.rate)} ·{" "}
+                          {formatDate(item.exchangeRate.date)}
+                        </p>
+                      </div>
+                    ) : null}
+                    {item.rulesResolution?.status &&
+                    item.rulesResolution.status !== "exact" ? (
+                      <Alert>
+                        <AlertCircle />
+                        <AlertTitle>
+                          {item.rulesResolution.status === "estimated"
+                            ? "Reglas estimadas"
+                            : "Sin cálculo histórico exacto"}
+                        </AlertTitle>
+                        <AlertDescription>
+                          {item.rulesResolution.warnings.join(" ")}
+                        </AlertDescription>
+                      </Alert>
+                    ) : null}
+                    {item.sourceReconciliation?.status === "mismatch" ? (
+                      <Alert className="border-amber-500/30 bg-amber-500/5">
+                        <AlertCircle />
+                        <AlertTitle>
+                          Guardado con diferencias revisadas
+                        </AlertTitle>
+                        <AlertDescription>
+                          Los conceptos no coincidían completamente con los
+                          totales impresos del recibo.
+                        </AlertDescription>
+                      </Alert>
+                    ) : null}
+                    {item.sourceReconciliation?.status === "unavailable" ? (
+                      <Alert>
+                        <Info />
+                        <AlertTitle>Sin totales impresos detectados</AlertTitle>
+                        <AlertDescription>
+                          Este escenario se guardó sin reconciliación
+                          automática.
+                        </AlertDescription>
+                      </Alert>
+                    ) : null}
+                  </div>
+                  <div className="min-w-0">
+                    {item.sourceConcepts?.length ? (
+                      <div className="rounded-xl border p-3">
+                        <p className="text-sm font-medium">
+                          {item.sourceConcepts.length} conceptos del recibo
+                        </p>
+                        <ul className="mt-3 flex max-h-64 flex-col gap-2 overflow-y-auto pr-1 text-xs">
+                          {item.sourceConcepts.map((concept) => (
+                            <li
+                              key={concept.id}
+                              className="flex items-start justify-between gap-3 border-t pt-2 first:border-0 first:pt-0"
+                            >
+                              <span className="min-w-0">
+                                <span className="block truncate font-medium">
+                                  {concept.name}
+                                </span>
+                                <span className="text-muted-foreground">
+                                  {conceptNatureLabels[concept.nature]} ·{" "}
+                                  {conceptTreatmentLabels[concept.treatment]}
+                                  {!concept.selected ? " · Excluido" : ""}
+                                </span>
+                              </span>
+                              <span className="shrink-0 font-mono">
+                                {money.format(concept.amount)}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-col gap-2 border-t pt-4 sm:flex-row sm:flex-wrap sm:items-center">
+                  {item.scenarioType === "sac" ? (
+                    <>
+                      <Button
+                        variant="outline"
+                        className="min-h-11 w-full sm:w-auto"
+                        disabled={monthlyCandidates.length === 0}
+                        onClick={() => {
+                          setMergeCandidate(item);
+                          setMergeTargetId(monthlyCandidates[0]?.id ?? "");
+                        }}
+                      >
+                        Unir con escenario mensual
+                      </Button>
+                      {monthlyCandidates.length === 0 ? (
+                        <p className="text-xs leading-5 text-muted-foreground sm:flex-1">
+                          Primero guardá un escenario mensual de este mismo mes.
+                        </p>
+                      ) : null}
+                    </>
+                  ) : null}
+                  <Button
+                    aria-label={`Eliminar escenario de ${formatPeriod(item.period)}`}
+                    className="min-h-11 w-full sm:ml-auto sm:w-auto"
+                    variant="ghost"
+                    onClick={() => setDeleteCandidate(item.id)}
+                  >
+                    <Trash2 data-icon="inline-start" /> Eliminar
+                  </Button>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          );
+        })}
+      </Accordion>
+    </>
+  );
+}
+
 function SavedScenariosView({
   scenarios,
   onCreate,
@@ -1180,11 +1615,44 @@ function SavedScenariosView({
   const [deleteCandidate, setDeleteCandidate] = useState<string>();
   const [mergeCandidate, setMergeCandidate] = useState<SalaryScenario>();
   const [mergeTargetId, setMergeTargetId] = useState("");
+  const [filters, setFilters] = useState(readScenarioFilters);
+  const typeFilter = filters.type;
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
   const orderedScenarios = useMemo(
     () => scenarios.toSorted((a, b) => b.period.localeCompare(a.period)),
     [scenarios],
   );
+  const availableYears = useMemo(
+    () =>
+      [
+        ...new Set(scenarios.map((scenario) => scenario.period.slice(0, 4))),
+      ].sort((a, b) => b.localeCompare(a)),
+    [scenarios],
+  );
+  const yearFilter =
+    filters.year === "all" || availableYears.includes(filters.year)
+      ? filters.year
+      : "all";
+  const filteredScenarios = useMemo(
+    () =>
+      orderedScenarios.filter(
+        (scenario) =>
+          (yearFilter === "all" || scenario.period.startsWith(yearFilter)) &&
+          (typeFilter === "all" ||
+            (typeFilter === "sac"
+              ? scenario.scenarioType === "sac" || scenario.sac > 0
+              : typeFilter === "vacation"
+                ? scenario.scenarioType === "vacation"
+                : scenario.scenarioType == null ||
+                  scenario.scenarioType === "salary")),
+      ),
+    [orderedScenarios, typeFilter, yearFilter],
+  );
+
+  const updateFilters = (next: ScenarioFilters) => {
+    setFilters(next);
+    writeScenarioFilters(next);
+  };
 
   useEffect(() => {
     const dialog = deleteDialogRef.current;
@@ -1223,122 +1691,91 @@ function SavedScenariosView({
         pendingCount={historicalPendingCount}
         onRetry={onRetryHistoricalRates}
       />
-      <div className="mb-6">
-        <SalaryHistoryChart scenarios={scenarios} />
+      <div className="mb-3 flex flex-col gap-2 rounded-xl border bg-card p-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+          <Select
+            value={yearFilter}
+            onValueChange={(year) => updateFilters({ ...filters, year })}
+          >
+            <SelectTrigger
+              className="h-9 w-full sm:w-36"
+              aria-label="Filtrar escenarios por año"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="all">Todos los años</SelectItem>
+                {availableYears.map((year) => (
+                  <SelectItem key={year} value={year}>
+                    {year}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <ToggleGroup
+            type="single"
+            value={typeFilter}
+            onValueChange={(value) => {
+              if (value)
+                updateFilters({
+                  ...filters,
+                  type: value as ScenarioTypeFilter,
+                });
+            }}
+            className="grid h-9 grid-cols-4 rounded-lg bg-muted p-0.5"
+            aria-label="Filtrar escenarios por tipo"
+          >
+            <ToggleGroupItem value="all" className="h-8 px-3 text-xs">
+              Todos
+            </ToggleGroupItem>
+            <ToggleGroupItem value="salary" className="h-8 px-3 text-xs">
+              Mensuales
+            </ToggleGroupItem>
+            <ToggleGroupItem value="sac" className="h-8 px-3 text-xs">
+              SAC
+            </ToggleGroupItem>
+            <ToggleGroupItem value="vacation" className="h-8 px-3 text-xs">
+              Vacaciones
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+        <p
+          className="px-1 text-xs tabular-nums text-muted-foreground"
+          role="status"
+        >
+          {filteredScenarios.length} de {scenarios.length} escenarios
+        </p>
       </div>
-      <div className="grid min-w-0 gap-4 md:grid-cols-2">
-        {orderedScenarios.map((item) => {
-          const itemResult = calculateSalary(item);
-          const monthlyCandidates = scenarios.filter(
-            (candidate) =>
-              candidate.id !== item.id &&
-              candidate.scenarioType !== "sac" &&
-              candidate.period === item.period,
-          );
-          return (
-            <Card key={item.id} className="min-w-0 overflow-hidden">
-              <CardHeader>
-                <div className="mb-2 flex flex-wrap items-center gap-2">
-                  <Badge variant="outline">{formatPeriod(item.period)}</Badge>
-                  {item.sac > 0 ? (
-                    <Badge>
-                      {item.scenarioType === "sac"
-                        ? "SAC individual"
-                        : "Incluye SAC"}
-                    </Badge>
-                  ) : null}
-                </div>
-                <CardTitle className="sr-only">
-                  Escenario de {formatPeriod(item.period)}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-5">
-                <div>
-                  <p className="break-all text-2xl font-bold text-primary min-[360px]:text-3xl">
-                    {money.format(itemResult.net)}
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Neto estimado
-                  </p>
-                  {item.exchangeRate ? (
-                    <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[.06] px-3 py-2.5">
-                      <p className="font-mono text-lg font-bold tabular-nums">
-                        {usdMoney.format(
-                          convertArsToUsd(
-                            itemResult.net,
-                            item.exchangeRate.rate,
-                          ) ?? 0,
-                        )}
-                      </p>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        {exchangeRateDescription(item.exchangeRate)}
-                      </p>
-                      <p className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">
-                        1 USD = {money.format(item.exchangeRate.rate)} ·{" "}
-                        {formatDate(item.exchangeRate.date)}
-                      </p>
-                    </div>
-                  ) : (
-                    <p className="mt-3 text-xs text-muted-foreground">
-                      Sin cotización guardada
-                    </p>
-                  )}
-                </div>
-                <div className="grid grid-cols-2 gap-3 rounded-xl bg-muted/60 p-4">
-                  <div>
-                    <p className="text-xs text-muted-foreground">Bruto</p>
-                    <p className="mt-1 break-all font-mono text-sm font-semibold tabular-nums">
-                      {money.format(itemResult.gross)}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-muted-foreground">Deducciones</p>
-                    <p className="mt-1 break-all font-mono text-sm font-semibold tabular-nums">
-                      {money.format(itemResult.deductions)}
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-              <CardFooter className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
-                <Button
-                  className="min-h-11 w-full sm:flex-1"
-                  onClick={() => onOpen(item)}
-                >
-                  Abrir escenario <ArrowRight data-icon="inline-end" />
-                </Button>
-                {item.scenarioType === "sac" && (
-                  <>
-                    <Button
-                      variant="outline"
-                      className="min-h-11 w-full sm:w-auto"
-                      disabled={monthlyCandidates.length === 0}
-                      onClick={() => {
-                        setMergeCandidate(item);
-                        setMergeTargetId(monthlyCandidates[0]?.id ?? "");
-                      }}
-                    >
-                      Unir con escenario mensual
-                    </Button>
-                    {monthlyCandidates.length === 0 && (
-                      <p className="w-full text-xs leading-5 text-muted-foreground">
-                        Primero guardá un escenario mensual de este mismo mes.
-                      </p>
-                    )}
-                  </>
-                )}
-                <Button
-                  aria-label={`Eliminar escenario de ${formatPeriod(item.period)}`}
-                  className="min-h-11 w-full sm:w-auto"
-                  variant="ghost"
-                  onClick={() => setDeleteCandidate(item.id)}
-                >
-                  <Trash2 data-icon="inline-start" /> Eliminar
-                </Button>
-              </CardFooter>
-            </Card>
-          );
-        })}
-      </div>
+      {filteredScenarios.length > 0 ? (
+        <div className="mb-3">
+          <SalaryHistoryChart scenarios={filteredScenarios} />
+        </div>
+      ) : null}
+      <SavedScenarioList
+        filteredScenarios={filteredScenarios}
+        scenarios={scenarios}
+        onOpen={onOpen}
+        setMergeCandidate={setMergeCandidate}
+        setMergeTargetId={setMergeTargetId}
+        setDeleteCandidate={setDeleteCandidate}
+      />
+      {filteredScenarios.length === 0 ? (
+        <div className="rounded-b-xl border-x border-b bg-card px-4 py-10 text-center">
+          <p className="text-sm font-medium">
+            No hay escenarios con estos filtros
+          </p>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mt-2"
+            onClick={() => updateFilters(DEFAULT_SCENARIO_FILTERS)}
+          >
+            Limpiar filtros
+          </Button>
+        </div>
+      ) : null}
       <Dialog
         open={Boolean(mergeCandidate)}
         onOpenChange={(open) => {
@@ -1368,7 +1805,8 @@ function SavedScenariosView({
                 <SelectGroup>
                   {scenarios.reduce<React.ReactNode[]>((options, candidate) => {
                     if (
-                      candidate.scenarioType === "sac" ||
+                      (candidate.scenarioType !== undefined &&
+                        candidate.scenarioType !== "salary") ||
                       candidate.period !== mergeCandidate?.period
                     ) {
                       return options;
@@ -1550,6 +1988,26 @@ function ResultPanel({
     : undefined;
   return (
     <aside className="min-w-0 lg:sticky lg:top-24 lg:self-start">
+      {result.rulesResolution.status !== "exact" ? (
+        <Alert
+          variant={
+            result.rulesResolution.status === "unsupported"
+              ? "destructive"
+              : "default"
+          }
+          className="mb-4"
+        >
+          <AlertCircle />
+          <AlertTitle>
+            {result.rulesResolution.status === "unsupported"
+              ? "Período disponible sólo para revisión"
+              : "Cálculo con reglas estimadas"}
+          </AlertTitle>
+          <AlertDescription>
+            {result.rulesResolution.warnings.join(" ")}
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <Card className="min-w-0 border-primary/25 bg-gradient-to-b from-primary/[.08] to-card">
         <CardHeader>
           <div className="flex min-w-0 items-start justify-between gap-3">
@@ -1658,6 +2116,12 @@ function ResultPanel({
                   label="No remunerativo"
                   value={result.nonRemunerative}
                 />
+                {result.reimbursements ? (
+                  <SummaryRow
+                    label="Reintegros"
+                    value={result.reimbursements}
+                  />
+                ) : null}
               </>
             ) : null}
             <SummaryRow
@@ -1685,6 +2149,19 @@ function ResultPanel({
                 Fuente: {result.rulesSource}. Verificado el{" "}
                 {formatDate(result.rulesVerifiedAt)}.
               </p>
+              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+                {result.rulesResolution.sources.map((source) => (
+                  <a
+                    key={`${source.authority}-${source.url}`}
+                    className="text-primary underline underline-offset-4"
+                    href={source.url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {source.authority}
+                  </a>
+                ))}
+              </div>
             </AlertDescription>
           </Alert>
         </CardContent>
@@ -1730,22 +2207,380 @@ function SummaryRow({
     </div>
   );
 }
+
+function PaystubConceptTable({
+  concepts,
+  onConceptChange,
+}: {
+  concepts: PaystubConcept[];
+  onConceptChange: (
+    itemId: string,
+    changes: Partial<Pick<PaystubConcept, "nature" | "treatment" | "selected">>,
+  ) => void;
+}) {
+  return (
+    <div
+      data-overflow-allow="scroll-container"
+      className="max-w-full overflow-x-auto rounded-xl border overscroll-x-contain"
+    >
+      <Table className="min-w-[940px]">
+        <TableHeader className="bg-muted text-xs uppercase text-muted-foreground">
+          <TableRow>
+            <TableHead>Concepto</TableHead>
+            <TableHead>Naturaleza</TableHead>
+            <TableHead>Tratamiento</TableHead>
+            <TableHead>Incluir</TableHead>
+            <TableHead className="text-right">Importe</TableHead>
+            <TableHead>
+              <div className="flex items-center gap-1">
+                <span>Confianza</span>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-6 shrink-0"
+                      aria-label="¿Qué significa la confianza de la lectura?"
+                    >
+                      <HelpCircle />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent
+                    className="w-72 text-sm font-normal normal-case"
+                    align="end"
+                    collisionPadding={16}
+                  >
+                    Indica qué tan segura es la lectura automática. Alta
+                    significa que encontramos el concepto y el importe alineados
+                    dentro de una sección clara. Si aparece Media o Baja,
+                    conviene revisar el dato antes de usarlo.
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {concepts.slice(0, 30).map((item) => {
+            const confidence = displayedConfidence(item);
+            return (
+              <TableRow key={item.id}>
+                <TableCell className="max-w-xs">
+                  <p className="truncate font-medium">{item.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Página {item.evidence.page}
+                  </p>
+                </TableCell>
+                <TableCell>
+                  <Select
+                    value={item.nature}
+                    onValueChange={(value) =>
+                      onConceptChange(item.id, {
+                        nature: value as ConceptNature,
+                      })
+                    }
+                  >
+                    <SelectTrigger
+                      className="w-44"
+                      aria-label={`Naturaleza de ${item.name}`}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="max-h-72 [&_[data-radix-select-viewport]]:h-auto [&_[data-radix-select-viewport]]:max-h-64 [&_[data-radix-select-viewport]]:overflow-y-auto">
+                      <SelectGroup>
+                        {Object.entries(conceptNatureLabels).map(
+                          ([value, label]) => (
+                            <SelectItem key={value} value={value}>
+                              {label}
+                            </SelectItem>
+                          ),
+                        )}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </TableCell>
+                <TableCell>
+                  <Select
+                    value={item.treatment}
+                    onValueChange={(value) =>
+                      onConceptChange(item.id, {
+                        treatment: value as ConceptTreatment,
+                      })
+                    }
+                  >
+                    <SelectTrigger
+                      className="w-44"
+                      aria-label={`Tratamiento de ${item.name}`}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {Object.entries(conceptTreatmentLabels).map(
+                          ([value, label]) => (
+                            <SelectItem key={value} value={value}>
+                              {label}
+                            </SelectItem>
+                          ),
+                        )}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </TableCell>
+                <TableCell>
+                  <Checkbox
+                    checked={item.selected}
+                    aria-label={`Incluir ${item.name} en el cálculo`}
+                    onCheckedChange={(checked) =>
+                      onConceptChange(item.id, { selected: checked === true })
+                    }
+                  />
+                </TableCell>
+                <TableCell className="text-right font-mono">
+                  {money.format(item.amount)}
+                </TableCell>
+                <TableCell>
+                  <Badge
+                    className={cn(
+                      confidence === "low" &&
+                        "border-amber-500/30 bg-amber-500/10 text-amber-500",
+                    )}
+                  >
+                    {confidence === "high"
+                      ? "Alta"
+                      : confidence === "medium"
+                        ? "Media"
+                        : "Baja"}
+                  </Badge>
+                </TableCell>
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function PaystubFindings({ findings }: { findings: AuditFinding[] }) {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {findings.map((finding) => (
+        <Alert
+          key={finding.id}
+          className={cn(
+            "rounded-xl border p-4",
+            finding.severity === "review"
+              ? "border-amber-500/30 bg-amber-500/5"
+              : "bg-muted/40",
+          )}
+        >
+          <AlertCircle className="text-amber-500" />
+          <AlertTitle>{finding.title}</AlertTitle>
+          <AlertDescription>
+            {finding.detail}
+            {finding.expected != null && finding.actual != null ? (
+              <span className="mt-2 block font-mono text-xs">
+                Observado: {money.format(finding.actual)} · Esperado:{" "}
+                {money.format(finding.expected)} · Diferencia:{" "}
+                {money.format(finding.actual - finding.expected)}
+              </span>
+            ) : null}
+            {finding.basis ? (
+              <span className="mt-2 block text-xs text-muted-foreground">
+                Base aplicada: {money.format(finding.basis.amount)} · Tasa:{" "}
+                {(finding.basis.rate * 100).toLocaleString("es-AR", {
+                  maximumFractionDigits: 2,
+                })}
+                %
+                {finding.basis.cap != null
+                  ? ` · Tope: ${money.format(finding.basis.cap)}`
+                  : ""}
+                {finding.basis.concepts.length > 0
+                  ? ` · Conceptos: ${finding.basis.concepts.join(", ")}`
+                  : ""}
+                {finding.basis.source
+                  ? ` · Fuente: ${finding.basis.source}`
+                  : ""}
+              </span>
+            ) : null}
+          </AlertDescription>
+        </Alert>
+      ))}
+    </div>
+  );
+}
+
+function PaystubActions({
+  status,
+  disabled,
+  onSave,
+  onVerify,
+}: {
+  status: PaystubActionStatus;
+  disabled: boolean;
+  onSave: () => void;
+  onVerify: () => void;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <p className="min-w-0 text-xs text-muted-foreground">
+        Confirmá y corregí los valores en la calculadora antes de tomar
+        decisiones.
+      </p>
+      <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto sm:flex-row">
+        <Button
+          className="min-h-11 w-full transition-[color,background-color,border-color,box-shadow,transform,opacity] active:scale-[0.98] sm:w-auto"
+          variant={status === "error" ? "destructive" : "default"}
+          disabled={disabled}
+          onClick={onSave}
+        >
+          {status === "saving" ? (
+            <Loader2 data-icon="inline-start" className="animate-spin" />
+          ) : status === "saved" ? (
+            <CheckCircle2 data-icon="inline-start" />
+          ) : status === "error" ? (
+            <AlertCircle data-icon="inline-start" />
+          ) : null}
+          <span aria-live="polite">
+            {status === "saving"
+              ? "Guardando…"
+              : status === "saved"
+                ? "Guardado"
+                : status === "error"
+                  ? "No se pudo guardar"
+                  : "Usar valores detectados"}
+          </span>
+          {status === "idle" ? <ArrowRight data-icon="inline-end" /> : null}
+        </Button>
+        <Button
+          variant="outline"
+          className="min-h-11 w-full transition-[color,background-color,border-color,box-shadow,transform,opacity] active:scale-[0.98] sm:w-auto"
+          disabled={disabled}
+          onClick={onVerify}
+        >
+          {status === "verifying" ? (
+            <Loader2 data-icon="inline-start" className="animate-spin" />
+          ) : status === "verified" ? (
+            <CheckCircle2 data-icon="inline-start" />
+          ) : null}
+          <span aria-live="polite">
+            {status === "verifying"
+              ? "Verificando…"
+              : status === "verified"
+                ? "Listo"
+                : "Verificar valores detectados"}
+          </span>
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function PaystubReview({
   parsed,
-  result,
-  onApply,
-  onDestinationChange,
+  onSave,
+  onSaveComplete,
+  onVerify,
+  onConceptChange,
+  onReconciliationConfirm,
   onDelete,
 }: {
   parsed: ParsedPaystub;
-  result: ReturnType<typeof calculateSalary>;
-  onApply: () => void;
-  onDestinationChange: (itemId: string, destination: "salary" | "sac") => void;
+  onSave: () => Promise<boolean>;
+  onSaveComplete: () => void;
+  onVerify: () => void;
+  onConceptChange: (
+    itemId: string,
+    changes: Partial<Pick<PaystubConcept, "nature" | "treatment" | "selected">>,
+  ) => void;
+  onReconciliationConfirm: (confirmed: boolean) => void;
   onDelete: () => void;
 }) {
+  const [actionStatus, setActionStatus] = useState<PaystubActionStatus>("idle");
+  const actionInProgress = useRef(false);
+  const concepts = conceptsFromPaystub(parsed);
+  const reviewScenario = scenarioFromPaystub(
+    { ...defaultScenario, id: parsed.id },
+    parsed,
+  );
+  const result = calculateSalary(reviewScenario);
   const findings = auditPaystub(parsed, result);
+  const reconciliation = reconcilePaystub(parsed);
+  const reconciliationBlocked =
+    reconciliation.status === "mismatch" && !reconciliation.confirmed;
+  const unsupported = result.rulesResolution.status === "unsupported";
+  const actionPending =
+    actionStatus === "saving" || actionStatus === "verifying";
+  const actionFinished =
+    actionStatus === "saved" || actionStatus === "verified";
+  const visibleFindings = findings.filter(
+    (finding) => finding.severity !== "ok",
+  );
+  const subtotal = (predicate: (item: PaystubConcept) => boolean) =>
+    concepts
+      .filter((item) => item.selected && predicate(item))
+      .reduce((sum, item) => sum + item.amount, 0);
+  const subtotals = [
+    ["Remunerativos", subtotal((item) => item.treatment === "remunerative")],
+    [
+      "No remunerativos",
+      subtotal((item) => item.treatment === "non-remunerative"),
+    ],
+    ["Reintegros", subtotal((item) => item.nature === "reimbursement")],
+    [
+      "Descuentos legales",
+      subtotal((item) =>
+        ["pension", "health", "pami", "income-tax"].includes(item.nature),
+      ),
+    ],
+    [
+      "Descuentos particulares",
+      subtotal(
+        (item) =>
+          item.treatment === "deduction" &&
+          ["union", "advance", "other-deduction"].includes(item.nature),
+      ),
+    ],
+    ["Informativos", subtotal((item) => item.treatment === "informational")],
+  ] as const;
+
+  async function handleSave() {
+    if (actionInProgress.current) return;
+    actionInProgress.current = true;
+    setActionStatus("saving");
+    await new Promise((resolve) => setTimeout(resolve, motionDelay(300)));
+    const saved = await onSave();
+    if (!saved) {
+      setActionStatus("error");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      setActionStatus("idle");
+      actionInProgress.current = false;
+      return;
+    }
+    setActionStatus("saved");
+    await new Promise((resolve) => setTimeout(resolve, motionDelay(450)));
+    onSaveComplete();
+  }
+
+  async function handleVerify() {
+    if (actionInProgress.current) return;
+    actionInProgress.current = true;
+    setActionStatus("verifying");
+    await new Promise((resolve) => setTimeout(resolve, motionDelay(300)));
+    setActionStatus("verified");
+    await new Promise((resolve) => setTimeout(resolve, motionDelay(350)));
+    onVerify();
+  }
+
   return (
-    <Card>
+    <Card
+      className={cn(
+        "transition-[opacity,transform] duration-300",
+        actionFinished && "translate-y-1 opacity-75",
+      )}
+    >
       <CardHeader>
         <div className="flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0">
@@ -1756,8 +2591,7 @@ function PaystubReview({
               {parsed.period
                 ? `Período ${parsed.period}`
                 : "Período no identificado"}{" "}
-              · {parsed.items.length + parsed.deductions.length} conceptos
-              detectados
+              · {concepts.length} conceptos detectados
             </CardDescription>
             {parsed.paymentDate ? (
               <p className="mt-1 text-xs text-muted-foreground">
@@ -1776,108 +2610,111 @@ function PaystubReview({
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
-        <div
-          data-overflow-allow="scroll-container"
-          className="max-w-full overflow-x-auto rounded-xl border overscroll-x-contain"
-        >
-          <Table className="min-w-[560px]">
-            <TableHeader className="bg-muted text-xs uppercase text-muted-foreground">
-              <TableRow>
-                <TableHead>Concepto</TableHead>
-                <TableHead>Clasificación</TableHead>
-                <TableHead className="text-right">Importe</TableHead>
-                <TableHead>
-                  <div className="flex items-center gap-1">
-                    <span>Confianza</span>
-                    <Popover>
-                      <PopoverTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="size-6 shrink-0"
-                          aria-label="¿Qué significa la confianza de la lectura?"
-                        >
-                          <HelpCircle />
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent
-                        className="w-72 text-sm font-normal normal-case"
-                        align="end"
-                        collisionPadding={16}
-                      >
-                        Indica qué tan segura es la lectura automática. Alta
-                        significa que encontramos el concepto y el importe
-                        alineados dentro de una sección clara. Si aparece Media
-                        o Baja, conviene revisar el dato antes de usarlo.
-                      </PopoverContent>
-                    </Popover>
-                  </div>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {[...parsed.items, ...parsed.deductions]
-                .slice(0, 30)
-                .map((item) => (
-                  <TableRow key={item.id}>
-                    <TableCell className="max-w-xs">
-                      <p className="truncate font-medium">{item.name}</p>
-                      <p className="text-xs text-muted-foreground">
-                        Página {item.evidence.page}
-                      </p>
-                    </TableCell>
-                    <TableCell>
-                      {"kind" in item && item.kind === "remunerative" ? (
-                        <Select
-                          value={item.destination ?? "salary"}
-                          onValueChange={(value) =>
-                            onDestinationChange(
-                              item.id,
-                              value as "salary" | "sac",
-                            )
-                          }
-                        >
-                          <SelectTrigger
-                            className="w-44"
-                            aria-label={`Clasificación de ${item.name}`}
-                          >
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="salary">Remunerativo</SelectItem>
-                            <SelectItem value="sac">SAC / aguinaldo</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      ) : "kind" in item ? (
-                        "No remunerativo"
-                      ) : (
-                        "Deducción"
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono">
-                      {money.format(item.amount)}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        className={cn(
-                          item.evidence.confidence === "low" &&
-                            "border-amber-500/30 bg-amber-500/10 text-amber-500",
-                        )}
-                      >
-                        {item.evidence.confidence === "high"
-                          ? "Alta"
-                          : item.evidence.confidence === "medium"
-                            ? "Media"
-                            : "Baja"}
-                      </Badge>
-                    </TableCell>
-                  </TableRow>
-                ))}
-            </TableBody>
-          </Table>
+        {unsupported ? (
+          <Alert>
+            <Info />
+            <AlertTitle>Recibo disponible sólo para revisión</AlertTitle>
+            <AlertDescription>
+              Podés revisar los conceptos extraídos, pero el cálculo histórico
+              está disponible desde enero de 2019.
+            </AlertDescription>
+          </Alert>
+        ) : result.rulesResolution.status === "estimated" ? (
+          <Alert>
+            <AlertCircle />
+            <AlertTitle>Comparación estimada</AlertTitle>
+            <AlertDescription>
+              {result.rulesResolution.warnings.join(" ")}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {subtotals.map(([label, amount]) => (
+            <div key={label} className="rounded-lg border bg-muted/30 p-3">
+              <p className="text-xs text-muted-foreground">{label}</p>
+              <p className="font-mono text-sm font-semibold">
+                {money.format(amount)}
+              </p>
+            </div>
+          ))}
         </div>
-        {parsed.items.length + parsed.deductions.length === 0 && (
+        {reconciliation.status !== "matched" ? (
+          <Alert
+            className={cn(
+              reconciliation.status === "mismatch"
+                ? "border-amber-500/30 bg-amber-500/5"
+                : "bg-muted/40",
+            )}
+          >
+            <AlertCircle />
+            <AlertTitle>
+              {reconciliation.status === "mismatch"
+                ? "Hay diferencias con los totales impresos"
+                : "No encontramos totales impresos"}
+            </AlertTitle>
+            <AlertDescription>
+              {reconciliation.status === "unavailable" ? (
+                "Podés continuar, pero conviene revisar manualmente los conceptos."
+              ) : (
+                <div className="mt-2 grid gap-1 text-xs">
+                  {(
+                    [
+                      ["remunerative", "Remunerativos"],
+                      ["nonRemunerative", "No remunerativos"],
+                      ["deductions", "Deducciones"],
+                      ["gross", "Bruto"],
+                      ["net", "Neto"],
+                    ] as const
+                  ).map(([key, label]) =>
+                    reconciliation.printed[key] == null ||
+                    reconciliation.calculated[key] == null ||
+                    isPaystubAmountWithinTolerance(
+                      reconciliation.calculated[key]!,
+                      reconciliation.printed[key]!,
+                      paystubReconciliationReference(reconciliation.printed),
+                    ) ? null : (
+                      <div
+                        key={key}
+                        className="grid grid-cols-[1fr_auto] gap-3"
+                      >
+                        <span>
+                          {label}: impreso{" "}
+                          {money.format(reconciliation.printed[key]!)},
+                          detectado{" "}
+                          {money.format(reconciliation.calculated[key]!)}
+                        </span>
+                        <span className="font-mono">
+                          Δ {money.format(reconciliation.differences[key]!)}
+                        </span>
+                      </div>
+                    ),
+                  )}
+                </div>
+              )}
+              {reconciliation.status === "mismatch" ? (
+                <label
+                  htmlFor={`reconciliation-${parsed.id}`}
+                  className="mt-4 flex cursor-pointer items-start gap-2 text-sm text-foreground"
+                >
+                  <Checkbox
+                    id={`reconciliation-${parsed.id}`}
+                    checked={reconciliation.confirmed}
+                    onCheckedChange={(checked) =>
+                      onReconciliationConfirm(checked === true)
+                    }
+                    aria-label="Confirmar que revisé las diferencias"
+                  />
+                  <span>Revisé las diferencias y quiero continuar</span>
+                </label>
+              ) : null}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+        <PaystubConceptTable
+          concepts={concepts}
+          onConceptChange={onConceptChange}
+        />
+        {concepts.length === 0 && (
           <details className="rounded-xl border bg-muted/30 p-4">
             <summary className="cursor-pointer font-medium">
               Ver texto extraído para revisión manual
@@ -1887,38 +2724,18 @@ function PaystubReview({
             </pre>
           </details>
         )}
-        <div className="grid gap-3 sm:grid-cols-2">
-          {findings.map((finding) => (
-            <Alert
-              key={finding.id}
-              className={cn(
-                "rounded-xl border p-4",
-                finding.severity === "ok"
-                  ? "border-primary/25 bg-primary/5"
-                  : finding.severity === "review"
-                    ? "border-amber-500/30 bg-amber-500/5"
-                    : "bg-muted/40",
-              )}
-            >
-              {finding.severity === "ok" ? (
-                <CheckCircle2 className="text-primary" />
-              ) : (
-                <AlertCircle className="text-amber-500" />
-              )}
-              <AlertTitle>{finding.title}</AlertTitle>
-              <AlertDescription>{finding.detail}</AlertDescription>
-            </Alert>
-          ))}
-        </div>
-        <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <p className="min-w-0 text-xs text-muted-foreground">
-            Confirmá y corregí los valores en la calculadora antes de tomar
-            decisiones.
-          </p>
-          <Button className="min-h-11 w-full sm:w-auto" onClick={onApply}>
-            Usar valores detectados <ArrowRight data-icon="inline-end" />
-          </Button>
-        </div>
+        <PaystubFindings findings={visibleFindings} />
+        <PaystubActions
+          status={actionStatus}
+          disabled={
+            unsupported ||
+            reconciliationBlocked ||
+            actionPending ||
+            actionFinished
+          }
+          onSave={() => void handleSave()}
+          onVerify={() => void handleVerify()}
+        />
       </CardContent>
     </Card>
   );

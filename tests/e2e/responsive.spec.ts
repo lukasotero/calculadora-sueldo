@@ -116,7 +116,7 @@ test("all responsive tiers remain inside the viewport", async ({
     ).toBeDisabled();
     await expect(page.getByRole("button", { name: "Guardado" })).toBeVisible();
     await page.getByRole("tab", { name: /Escenarios/ }).click();
-    await expect(page.getByText("Neto estimado").first()).toBeVisible();
+    await expect(page.locator("p").filter({ hasText: /^Neto$/ })).toBeVisible();
     await expectNoPageOverflow(page, `${label}: saved scenarios`);
 
     await page.getByRole("tab", { name: "Revisar recibo" }).click();

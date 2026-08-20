@@ -135,11 +135,10 @@ export default function HomePage() {
             </div>
           </div>
         </section>
-        <section
-          id="calculadora"
-          className="mx-auto max-w-7xl min-w-0 scroll-mt-24 px-4 py-10 sm:px-6 sm:py-14 2xl:px-8"
-        >
-          <SalaryCalculator />
+        <section id="calculadora" className="scroll-mt-24 border-y bg-muted/45">
+          <div className="mx-auto max-w-7xl min-w-0 px-4 py-10 sm:px-6 sm:py-14 2xl:px-8">
+            <SalaryCalculator />
+          </div>
         </section>
         <section id="metodologia" className="scroll-mt-20 border-y bg-card/40">
           <div className="mx-auto grid max-w-7xl min-w-0 gap-10 px-4 py-16 sm:px-6 lg:grid-cols-[minmax(0,.7fr)_minmax(0,1.3fr)] xl:gap-14 2xl:px-8">

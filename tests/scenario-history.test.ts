@@ -48,16 +48,55 @@ describe("salary history", () => {
     expect(points[0].period).toBe("2026-08");
   });
 
-  it("excludes standalone SAC scenarios until they are merged", () => {
-    const monthly = scenario("monthly", "2026-08", 2_000_000);
+  it("sums receipt-backed salary, SAC and vacations while ignoring manual scenarios", () => {
+    const monthly = {
+      ...scenario("monthly", "2026-08", 2_000_000),
+      sourcePaystubIds: ["salary-pdf"],
+    };
     const sac = {
       ...scenario("sac", "2026-08", 0),
       scenarioType: "sac" as const,
       sac: 500_000,
+      sourcePaystubIds: ["sac-pdf"],
     };
+    const vacation = {
+      ...scenario("vacation", "2026-08", 0),
+      scenarioType: "vacation" as const,
+      vacation: 300_000,
+      sourcePaystubIds: ["vacation-pdf"],
+    };
+    const manual = scenario("manual", "2026-08", 9_000_000);
 
-    expect(buildSalaryHistory([monthly, sac], "ARS")).toHaveLength(1);
-    expect(buildSalaryHistory([monthly, sac], "ARS")[0].scenarioCount).toBe(1);
+    const point = buildSalaryHistory(
+      [monthly, sac, vacation, manual],
+      "ARS",
+    )[0];
+    const expected = [monthly, sac, vacation].reduce(
+      (total, item) => total + buildSalaryHistory([item], "ARS")[0].value,
+      0,
+    );
+    expect(point).toMatchObject({
+      value: expected,
+      aggregation: "sum",
+      scenarioCount: 3,
+      receiptCount: 3,
+      hasSac: true,
+      hasVacation: true,
+    });
+  });
+
+  it("omits a receipt month in USD when one receipt lacks its quote", () => {
+    const quoted = {
+      ...scenario("salary", "2026-08", 2_000_000, 1_400),
+      sourcePaystubIds: ["salary-pdf"],
+    };
+    const missing = {
+      ...scenario("vacation", "2026-08", 0),
+      vacation: 300_000,
+      scenarioType: "vacation" as const,
+      sourcePaystubIds: ["vacation-pdf"],
+    };
+    expect(buildSalaryHistory([quoted, missing], "USD")).toEqual([]);
   });
 
   it("marks monthly points that include SAC", () => {
